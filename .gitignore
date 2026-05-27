@@ -1,0 +1,9 @@
+# Runtime state (per-session files written by hook.py)
+state/
+
+# Local Claude Code project settings / permissions
+.claude/
+
+# Python
+__pycache__/
+*.pyc
