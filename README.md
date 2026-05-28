@@ -118,8 +118,10 @@ Event → state mapping (in `hook.py`):
 - **A permission prompt didn't turn a row red?** The "waiting" detection relies
   on the `Notification` hook. If a prompt isn't classified as waiting, adjust the
   keyword matching in the `classify()` function in `hook.py`.
-- **A crashed/force-closed session lingers.** It never sent `SessionEnd`, so its
-  file stays until you press `c` (clears entries with no update for 6h). Tune
-  `STALE_AFTER` in `monitor.py` to change that window.
+- **A crashed/force-closed session lingers.** It never sends `SessionEnd`, but
+  the monitor auto-reaps it: each refresh it drops any session whose terminal
+  (`tty`) no longer has a live `claude` process. Sessions whose tty wasn't
+  captured (or if the process list can't be read) are kept, and `c` still clears
+  anything with no update for 6h as a backstop.
 - **"No sessions reporting yet."** Normal when no Claude Code instances are
   running, or none have fired an event since install.

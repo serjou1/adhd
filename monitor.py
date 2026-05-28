@@ -37,14 +37,46 @@ ORDER = {"waiting": 0, "working": 1, "idle": 2, "done": 2}
 LABEL = {"waiting": "WAITING", "working": "WORKING", "idle": "IDLE", "done": "IDLE"}
 
 
+def live_ttys():
+    """TTYs that currently host a live `claude` process.
+
+    Returns a set like {"ttys000", ...}, or None if we couldn't tell (in which
+    case callers must not prune — better a stale row than dropping a live one).
+    """
+    try:
+        out = subprocess.run(["ps", "-axo", "tty=,comm="],
+                             stdout=subprocess.PIPE, text=True).stdout
+    except Exception:
+        return None
+    ttys = set()
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and os.path.basename(parts[1].strip()) == "claude":
+            ttys.add(parts[0])
+    return ttys
+
+
 def load_sessions():
+    # Crashed/force-closed sessions never send SessionEnd, so they'd linger
+    # forever showing their last state (often a red WAITING). Drop any whose
+    # terminal no longer has a live claude. Skip pruning if we can't read the
+    # process list, or a record has no captured tty.
+    live = live_ttys()
     out = []
     for fp in glob.glob(os.path.join(STATE_DIR, "*.json")):
         try:
             with open(fp) as f:
-                out.append(json.load(f))
+                r = json.load(f)
         except Exception:
             continue  # mid-write or garbage; skip this tick
+        tty = (r.get("term", {}).get("tty") or "").replace("/dev/", "")
+        if live and tty and tty not in live:
+            try:
+                os.remove(fp)  # its terminal is gone; reap it
+            except OSError:
+                pass
+            continue
+        out.append(r)
     out.sort(key=lambda r: (ORDER.get(r.get("state"), 3), -r.get("updated", 0)))
     return out
 
