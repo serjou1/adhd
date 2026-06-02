@@ -25,6 +25,64 @@ That's it. It refreshes every second and picks up every Claude Code session
 automatically. No setup per project. Runtime state lives in `~/.adhd/state`
 (override with `ADHD_STATE_DIR`).
 
+## Menu bar (macOS)
+
+Don't want a whole terminal pane? `adhd-menu` puts a status-bar icon up top with
+a badge counting the sessions **WAITING** on a permission prompt — the ones that
+literally need your click. `◧ 2` means two sessions are blocked.
+
+```bash
+adhd-menu                     # run it now
+python3 install.py --login    # ...or auto-start it at login
+```
+
+Click the icon for a live menu:
+
+```
+  1 waiting · 2 working · 4 idle
+  ───────────────────────────────
+  🔴  arbitrage-core — Claude needs your permission (12s)
+  🟡  statistics-service — ran Bash (1s)
+  🟢  twitter-crawler — waiting for input (47s)
+  ───────────────────────────────
+  Open adhd monitor…
+  ───────────────────────────────
+  Quit
+```
+
+Pick any session to bring its window to the front (same focus logic as the
+dashboard — tmux pane, iTerm/Terminal tab, or VS Code window). **Open adhd
+monitor…** launches the full curses dashboard in a new Terminal window. The
+badge hides when nothing is waiting. Override the glyph with `ADHD_MENU_ICON`.
+
+### Notifications
+
+While `adhd-menu` is running it pops a macOS notification when a session needs
+you, so you can work in one window and get pulled back to another only when it
+matters:
+
+| When | Notification |
+|------|--------------|
+| A session **finishes its turn** (working → idle) | ✅ *project* — done |
+| A session **blocks on a permission prompt** (needs access) | 🔴 *project* needs you |
+
+Toggle notifications from the menu (**Notifications**), or start muted with
+`ADHD_NOTIFY=0`. No burst on startup — already-running sessions are seeded
+silently and only *transitions* after that fire a toast.
+
+Toasts aren't clickable — to jump to a session, click the menu-bar icon and
+pick it. (The toast just tells you *which* one needs you.)
+
+> **Why not clickable toasts?** A clickable notification needs macOS's modern
+> `UNUserNotificationCenter` API, which only authorizes a signed `.app` bundle.
+> The usual CLI tools (`terminal-notifier`, `alerter`) are stuck on the legacy
+> `NSUserNotification` API that **Apple removed in recent macOS** — their toasts
+> silently never appear, and no permission toggle fixes it. So `adhd` uses
+> `osascript`, which always delivers.
+
+> Needs the `rumps` package (a tiny PyObjC wrapper). `install.py` installs it for
+> you; otherwise `pip3 install --user rumps`.
+
 ## What you see
 
 ```
@@ -104,9 +162,10 @@ Event → state mapping (in `hook.py`):
 
 | Path | Role |
 |------|------|
-| `install.py`              | One-shot installer: adds the `adhd` command and wires the hooks. |
+| `install.py`              | One-shot installer: adds the `adhd` / `adhd-menu` commands, wires the hooks, installs `rumps` (`--login` adds a LaunchAgent). |
 | `hook.py`                 | Event handler; writes per-session state. Always exits 0 so it can't break a session. |
-| `monitor.py`              | The dashboard. |
+| `monitor.py`              | The terminal dashboard (also the shared session-loading / window-focus layer). |
+| `menubar.py`              | The macOS menu-bar app. Reuses `monitor.py`'s loading + focus logic. |
 | `~/.adhd/state/`          | One JSON file per live session (override with `ADHD_STATE_DIR`). |
 | `~/.claude/settings.json` | Holds the global `hooks` block that wires the events to `hook.py`. |
 
