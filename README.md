@@ -5,6 +5,8 @@ state, so you don't have to switch between projects to find the one stuck on a
 `yes / don't ask again` permission prompt. Select a session and hit Enter to jump
 straight to its window.
 
+![The adhd dashboard listing running Claude Code sessions by state](docs/monitor.png)
+
 ## Install
 
 ```bash
@@ -30,6 +32,8 @@ automatically. No setup per project. Runtime state lives in `~/.adhd/state`
 Don't want a whole terminal pane? `adhd-menu` puts a status-bar icon up top with
 a badge counting the sessions **WAITING** on a permission prompt — the ones that
 literally need your click. `◧ 2` means two sessions are blocked.
+
+![The menu-bar icon with a badge showing one waiting session](docs/menubar-badge.png)
 
 ```bash
 adhd-menu                     # run it now
@@ -65,6 +69,8 @@ matters:
 |------|--------------|
 | A session **finishes its turn** (working → idle) | ✅ *project* — done |
 | A session **blocks on a permission prompt** (needs access) | 🔴 *project* needs you |
+
+![A macOS notification reading "adhd needs you — claude-code · main — waiting for approval"](docs/notification.png)
 
 Toggle notifications from the menu (**Notifications**), or start muted with
 `ADHD_NOTIFY=0`. No burst on startup — already-running sessions are seeded
