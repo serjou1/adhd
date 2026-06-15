@@ -51,6 +51,14 @@ REFRESH = 1.0  # seconds between badge/menu refreshes
 ICON = os.environ.get("ADHD_MENU_ICON", "◧")
 # Notifications on by default; set ADHD_NOTIFY=0 to start with them muted.
 NOTIFY_DEFAULT = os.environ.get("ADHD_NOTIFY", "1") != "0"
+# Repeat reminders on by default: a session left waiting on a prompt gets pinged
+# again every REPEAT_AFTER seconds until you deal with it. Set ADHD_NOTIFY_REPEAT=0
+# to start with repeats off; override the interval with ADHD_NOTIFY_REPEAT_SECS.
+REPEAT_DEFAULT = os.environ.get("ADHD_NOTIFY_REPEAT", "1") != "0"
+try:
+    REPEAT_AFTER = max(1.0, float(os.environ.get("ADHD_NOTIFY_REPEAT_SECS", "600")))
+except ValueError:
+    REPEAT_AFTER = 600.0  # 10 minutes
 # Colored dot per state, used in the per-session menu rows.
 DOT = {"waiting": "🔴", "working": "🟡", "idle": "🟢", "done": "🟢"}
 LABEL = {"waiting": "waiting", "working": "working", "idle": "idle", "done": "idle"}
@@ -59,6 +67,14 @@ LABEL = {"waiting": "waiting", "working": "working", "idle": "idle", "done": "id
 def _osa_escape(s):
     """Escape a Python string for embedding inside an AppleScript "..." literal."""
     return str(s).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _repeat_label():
+    """Menu label for the repeat toggle, showing the actual interval."""
+    secs = int(REPEAT_AFTER)
+    if secs % 60 == 0:
+        return "Repeat reminders (%d min)" % (secs // 60)
+    return "Repeat reminders (%ds)" % secs
 
 
 # The applet that owns our banners. On launch it does one of two things:
@@ -212,9 +228,14 @@ class AdhdMenuApp(rumps.App):
         # quit_button=None: we render our own Quit so it survives menu rebuilds.
         super().__init__("adhd", title=ICON, quit_button=None)
         self.notify_enabled = NOTIFY_DEFAULT
+        # Re-ping sessions left waiting; off makes every prompt a one-shot toast.
+        self.repeat_enabled = REPEAT_DEFAULT
         # Last-seen state per session id, so we can spot transitions worth
         # announcing (turn finished, or newly blocked on a prompt).
         self.prev_state = {}
+        # When we last toasted about each session id, so a still-waiting prompt
+        # can be nudged again after REPEAT_AFTER. Cleared when it stops waiting.
+        self.last_notified = {}
         self.timer = rumps.Timer(self.refresh, REFRESH)
         self.timer.start()
         self.refresh(None)
@@ -235,32 +256,47 @@ class AdhdMenuApp(rumps.App):
         self.menu.update(self._build_menu(sessions, counts))
 
     def _maybe_notify(self, sessions):
-        """Fire a notification when a session finishes a turn or blocks on a prompt.
+        """Fire on state changes, and re-ping prompts you haven't dealt with.
 
         Compares each session's current state to what we saw last tick. We seed
         prev_state silently on first sight so we never fire a burst of stale
-        notifications on startup. Reaped sessions are dropped from the map.
+        notifications on startup. A session that *stays* waiting on a prompt is
+        nudged again every REPEAT_AFTER seconds while repeat reminders are on —
+        so a toast you didn't act on comes back instead of being missed. Reaped
+        sessions are dropped from both maps.
         """
         seen = set()
+        now = time.time()
         for s in sessions:
             sid = s.get("session_id")
             seen.add(sid)
             st = "idle" if s.get("state") == "done" else s.get("state", "idle")
             prev = self.prev_state.get(sid)
             self.prev_state[sid] = st
-            if prev is None or prev == st or not self.notify_enabled:
+            # A session that's no longer waiting has been dealt with: drop its
+            # timer so a fresh prompt later starts the repeat clock over.
+            if st != "waiting":
+                self.last_notified.pop(sid, None)
+            if prev is None or not self.notify_enabled:
                 continue
             proj = s.get("project") or "?"
             detail = s.get("detail") or ""
             if st == "waiting" and prev != "waiting":
                 notify("🔴 %s needs you" % proj, detail or "waiting for approval",
                        sound="Funk")
+                self.last_notified[sid] = now
             elif st == "idle" and prev == "working":
                 notify("✅ %s — done" % proj, detail or "turn finished")
+            elif (st == "waiting" and self.repeat_enabled
+                  and now - self.last_notified.get(sid, now) >= REPEAT_AFTER):
+                notify("🔴 %s still needs you" % proj,
+                       detail or "still waiting for approval", sound="Funk")
+                self.last_notified[sid] = now
         # Forget sessions that have gone away so a restart re-seeds cleanly.
         for sid in list(self.prev_state):
             if sid not in seen:
                 del self.prev_state[sid]
+                self.last_notified.pop(sid, None)
 
     def _build_menu(self, sessions, counts):
         items = []
@@ -294,12 +330,18 @@ class AdhdMenuApp(rumps.App):
         toggle = rumps.MenuItem("Notifications", callback=self._toggle_notify)
         toggle.state = 1 if self.notify_enabled else 0
         items.append(toggle)
+        repeat = rumps.MenuItem(_repeat_label(), callback=self._toggle_repeat)
+        repeat.state = 1 if self.repeat_enabled else 0
+        items.append(repeat)
         items.append(rumps.separator)
         items.append(rumps.MenuItem("Quit", callback=rumps.quit_application))
         return items
 
     def _toggle_notify(self, _):
         self.notify_enabled = not self.notify_enabled
+
+    def _toggle_repeat(self, _):
+        self.repeat_enabled = not self.repeat_enabled
 
     def _make_focus(self, session):
         """Closure so each session row focuses its own window when clicked."""

@@ -50,6 +50,8 @@ Click the icon for a live menu:
   🟢  twitter-crawler — waiting for input (47s)
   ───────────────────────────────
   Open adhd monitor…
+  ✓ Notifications
+  ✓ Repeat reminders (10 min)
   ───────────────────────────────
   Quit
 ```
@@ -69,12 +71,20 @@ matters:
 |------|--------------|
 | A session **finishes its turn** (working → idle) | ✅ *project* — done |
 | A session **blocks on a permission prompt** (needs access) | 🔴 *project* needs you |
+| A blocked session is **still waiting** after 10 min (repeat reminders on) | 🔴 *project* still needs you |
 
 ![A macOS notification reading "adhd needs you — claude-code · main — waiting for approval"](docs/notification.png)
 
 Toggle notifications from the menu (**Notifications**), or start muted with
 `ADHD_NOTIFY=0`. No burst on startup — already-running sessions are seeded
 silently and only *transitions* after that fire a toast.
+
+**Repeat reminders** (on by default) nudge you again every 10 minutes about a
+session that's *still* blocked on a prompt — so a banner you missed comes back
+instead of being lost. The moment the session stops waiting (you approve, or it
+moves on) the reminders stop. Toggle them from the menu (**Repeat reminders**),
+or start them off with `ADHD_NOTIFY_REPEAT=0`; change the interval (seconds)
+with `ADHD_NOTIFY_REPEAT_SECS`.
 
 Clicking a toast brings the waiting session's window to the front. To land on a
 specific one when several need you, click the menu-bar icon and pick it there.
