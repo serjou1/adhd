@@ -76,15 +76,23 @@ Toggle notifications from the menu (**Notifications**), or start muted with
 `ADHD_NOTIFY=0`. No burst on startup — already-running sessions are seeded
 silently and only *transitions* after that fire a toast.
 
-Toasts aren't clickable — to jump to a session, click the menu-bar icon and
-pick it. (The toast just tells you *which* one needs you.)
+Clicking a toast brings the waiting session's window to the front. To land on a
+specific one when several need you, click the menu-bar icon and pick it there.
 
-> **Why not clickable toasts?** A clickable notification needs macOS's modern
-> `UNUserNotificationCenter` API, which only authorizes a signed `.app` bundle.
-> The usual CLI tools (`terminal-notifier`, `alerter`) are stuck on the legacy
-> `NSUserNotification` API that **Apple removed in recent macOS** — their toasts
-> silently never appear, and no permission toggle fixes it. So `adhd` uses
-> `osascript`, which always delivers.
+> **How the click works.** A macOS banner is "owned" by whatever app calls
+> `display notification`, and clicking it opens that app. A bare `osascript`
+> toast is owned by Script Editor — which is why clicks used to pop *it* open.
+> So on first use `adhd` builds a tiny applet at `~/.adhd/adhd.app` (via
+> `osacompile`, branded `com.adhd.notifier` and ad-hoc signed) and posts every
+> banner *through it*. The banner is now owned by adhd, and clicking it
+> relaunches the applet, which focuses a waiting session (`menubar.py --focus`).
+> The applet rebuilds itself if deleted; the first banner from it may need
+> approving once in **System Settings → Notifications → adhd**.
+>
+> The modern `UNUserNotificationCenter` API could target the exact window per
+> banner, but it needs a fully packaged, signed `.app`; the old CLI tools
+> (`terminal-notifier`, `alerter`) are dead on macOS 14+ — they use the removed
+> `NSUserNotification` API and silently never appear.
 
 > Needs the `rumps` package (a tiny PyObjC wrapper). `install.py` installs it for
 > you; otherwise `pip3 install --user rumps`.
