@@ -13,6 +13,8 @@ import sys
 import time
 import tempfile
 
+from history import record_closed
+
 STATE_DIR = os.environ.get("ADHD_STATE_DIR") or os.path.join(
     os.path.expanduser("~"), ".adhd", "state")
 
@@ -111,8 +113,15 @@ def main():
     event = data.get("hook_event_name", "")
     path = os.path.join(STATE_DIR, sid + ".json")
 
-    # Session ended: remove its state file so it drops off the dashboard.
+    # Session ended cleanly: record it to history, then remove its state file so
+    # it drops off the dashboard. (Crash/power-off skips SessionEnd, so the
+    # dashboard's reaper records those closures instead — see monitor.load_sessions.)
     if event == "SessionEnd":
+        try:
+            with open(path) as f:
+                record_closed(json.load(f))
+        except Exception:
+            pass
         try:
             os.remove(path)
         except OSError:

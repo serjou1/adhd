@@ -13,12 +13,20 @@ import curses
 import glob
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
 
+from history import load_history, record_closed
+
 STATE_DIR = os.environ.get("ADHD_STATE_DIR") or os.path.join(
     os.path.expanduser("~"), ".adhd", "state")
+ADHD_HOME = os.path.dirname(STATE_DIR)  # ~/.adhd
+# Single-instance marker for the dashboard: written on launch, removed on exit.
+# It lets the menu bar focus an already-open dashboard instead of spawning a
+# second one. See write_dashboard_lock() / dashboard_session().
+DASHBOARD_LOCK = os.path.join(ADHD_HOME, "dashboard.json")
 REFRESH = 1.0          # seconds between redraws
 STALE_AFTER = 6 * 3600  # entries older than this are pruneable with 'c'
 
@@ -56,12 +64,54 @@ def live_ttys():
     return ttys
 
 
+_BOOT_TIME = None
+
+
+def boot_time():
+    """Unix time of the last system boot (cached for the process), 0 if unknown.
+
+    Used to reap sessions left over from before a reboot: their state files
+    survive a power-off but the claude procs don't, and after a reboot tty
+    numbers get reused — so the live-tty test alone could wrongly keep one (or
+    let it mis-focus a different, unrelated window). Anything last updated before
+    boot is provably from a past life, so we reap it straight to history.
+    """
+    global _BOOT_TIME
+    if _BOOT_TIME is None:
+        _BOOT_TIME = 0.0
+        try:
+            # macOS: "{ sec = 1718000000, usec = 0 } Tue Jun ..."
+            out = subprocess.check_output(
+                ["sysctl", "-n", "kern.boottime"],
+                stderr=subprocess.DEVNULL, text=True)
+            _BOOT_TIME = float(out.split("sec =", 1)[1].split(",", 1)[0])
+        except Exception:
+            pass
+    return _BOOT_TIME
+
+
+def _reap(fp, record):
+    """Remove a dead session's state file, recording its project to history first."""
+    record_closed(record)
+    try:
+        os.remove(fp)
+    except OSError:
+        pass
+
+
+def session_root(s):
+    """The project root for a live session record (term.root, else cwd)."""
+    return (s.get("term") or {}).get("root") or s.get("cwd") or ""
+
+
 def load_sessions():
     # Crashed/force-closed sessions never send SessionEnd, so they'd linger
     # forever showing their last state (often a red WAITING). Drop any whose
-    # terminal no longer has a live claude. Skip pruning if we can't read the
-    # process list, or a record has no captured tty.
+    # terminal no longer has a live claude, or that predates the last reboot,
+    # recording each to history on the way out. Skip the live-tty prune if we
+    # can't read the process list, or a record has no captured tty.
     live = live_ttys()
+    boot = boot_time()
     out = []
     for fp in glob.glob(os.path.join(STATE_DIR, "*.json")):
         try:
@@ -69,12 +119,14 @@ def load_sessions():
                 r = json.load(f)
         except Exception:
             continue  # mid-write or garbage; skip this tick
+        # Left over from before the last boot: its claude is gone and its tty may
+        # now belong to a different session, so reap outright rather than trust it.
+        if boot and r.get("updated", 0) < boot:
+            _reap(fp, r)
+            continue
         tty = (r.get("term", {}).get("tty") or "").replace("/dev/", "")
         if live and tty and tty not in live:
-            try:
-                os.remove(fp)  # its terminal is gone; reap it
-            except OSError:
-                pass
+            _reap(fp, r)  # its terminal is gone
             continue
         out.append(r)
     out.sort(key=lambda r: (ORDER.get(r.get("state"), 3), -r.get("updated", 0)))
@@ -97,7 +149,7 @@ def clear_stale():
             with open(fp) as f:
                 r = json.load(f)
             if now - r.get("updated", 0) > STALE_AFTER:
-                os.remove(fp)
+                _reap(fp, r)  # to history, like any other close
         except Exception:
             pass
 
@@ -113,6 +165,42 @@ def _run(cmd):
 
 def _osascript(script):
     return _run(["osascript", "-e", script])
+
+
+def _osa_str(s):
+    """Escape a Python string for embedding inside an AppleScript "..." literal."""
+    return str(s).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def open_project(entry):
+    """Re-open a recently-closed project: a fresh terminal running `claude` in it.
+
+    `entry` is a history record (see history.py). Opens a new window — iTerm if
+    that's where the session lived, otherwise Terminal.app — that cd's into the
+    project root and execs `claude`, restarting that project's session. Returns a
+    short status string for the footer.
+    """
+    root = entry.get("root") or entry.get("cwd") or ""
+    proj = entry.get("project") or (os.path.basename(root.rstrip("/")) if root else "?")
+    if not root or not os.path.isdir(root):
+        return "can't re-open %s — folder is gone" % proj
+    claude = shutil.which("claude") or "claude"
+    run = "cd %s && exec %s" % (shlex.quote(root), shlex.quote(claude))
+    if entry.get("term_program") == "iTerm.app":
+        # iTerm runs `command` via execvp (no shell), so wrap it in a login shell.
+        ok = _osascript(
+            'tell application "iTerm"\n'
+            '  activate\n'
+            '  create window with default profile command "%s"\n'
+            'end tell' % _osa_str("/bin/sh -lc %s" % shlex.quote(run)))
+    else:
+        # Terminal's `do script` runs the string in a fresh interactive shell.
+        ok = _osascript(
+            'tell application "Terminal"\n'
+            '  activate\n'
+            '  do script "%s"\n'
+            'end tell' % _osa_str(run))
+    return "re-opening %s…" % proj if ok else "couldn't re-open %s" % proj
 
 
 def focus_vscode_window(root, project):
@@ -207,7 +295,7 @@ def focus_session(s):
     return "no window info for this session (restart it to capture)"
 
 
-def draw(stdscr, colors, sessions, selected_sid, status_msg):
+def draw(stdscr, colors, sessions, history, selected_key, status_msg):
     now = time.time()
     h, w = stdscr.getmaxyx()
     stdscr.erase()
@@ -238,7 +326,7 @@ def draw(stdscr, colors, sessions, selected_sid, status_msg):
         attr = colors.get(st, 0)
         if st == "waiting":
             attr |= curses.A_BOLD
-        selected = s.get("session_id") == selected_sid
+        selected = ("s:" + (s.get("session_id") or "")) == selected_key
         if selected:
             attr |= curses.A_REVERSE
         marker = "▶ " if selected else "  "
@@ -254,14 +342,158 @@ def draw(stdscr, colors, sessions, selected_sid, status_msg):
         row += 1
 
     if not sessions:
-        stdscr.addnstr(5, 2, "No Claude Code sessions reporting yet.", w - 3, curses.A_DIM)
-        stdscr.addnstr(6, 2, "Start a session in any project (hooks must be installed).", w - 3, curses.A_DIM)
+        stdscr.addnstr(row + 1, 2, "No Claude Code sessions reporting yet.", w - 3, curses.A_DIM)
+        stdscr.addnstr(row + 2, 2, "Start a session in any project (hooks must be installed).", w - 3, curses.A_DIM)
+        row += 4
+
+    # Recently-closed projects (newest first). Select one and ⏎/r re-opens it:
+    # a fresh terminal running `claude` in that folder. Survives restarts and
+    # power-offs because it's read from history.json on disk.
+    if history and row < h - 1:
+        row += 1  # spacer between the live sessions and the closed ones
+        if row < h - 1:
+            stdscr.addnstr(row, 0, "  recently closed".ljust(w), w - 1,
+                           curses.A_DIM | curses.A_UNDERLINE)
+            row += 1
+        for e in history:
+            if row >= h - 1:
+                break
+            selected = ("h:" + (e.get("root") or "")) == selected_key
+            attr = curses.A_REVERSE if selected else curses.A_DIM
+            marker = "▶ " if selected else "  "
+            proj = (e.get("project") or "?")[:22]
+            age = fmt_age(now - e.get("closed", now))
+            root = e.get("root") or ""
+            detail = ("closed %s ago" % age)[:26]
+            line = f"{marker}{'CLOSED':<8} {proj:<22} {detail:<26} {'':>7}  {root}"
+            try:
+                stdscr.addnstr(row, 0, line.ljust(w), w - 1, attr)
+            except curses.error:
+                pass
+            row += 1
 
     if status_msg:
         stdscr.addnstr(h - 2, 0, ("  " + status_msg).ljust(w), w - 1, curses.A_DIM)
-    foot = "  ↑/↓ select   ⏎ focus window   c clear stale   q quit"
+    foot = "  ↑/↓ select   ⏎ focus / re-open   c clear stale   q quit"
     stdscr.addnstr(h - 1, 0, foot.ljust(w), w - 1, curses.A_BOLD)
     stdscr.refresh()
+
+
+def _activate(key, sessions, history, reopen_only=False):
+    """Act on the selected row: focus a live session, or re-open a closed project.
+
+    Selection is tracked by a stable key ("s:<session_id>" or "h:<root>") so it
+    survives the per-second resort. ⏎ does the natural thing for whichever kind
+    of row is selected; `r` (reopen_only) ignores live sessions.
+    """
+    if key.startswith("s:"):
+        if reopen_only:
+            return ""  # 'r' is for re-opening closed projects, not live rows
+        sid = key[2:]
+        s = next((x for x in sessions if (x.get("session_id") or "") == sid), None)
+        return focus_session(s) if s else ""
+    root = key[2:]
+    e = next((x for x in history if (x.get("root") or "") == root), None)
+    return open_project(e) if e else ""
+
+
+def _pid_alive(pid):
+    """True if a process with this pid exists (even if it isn't ours to signal)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # alive, just owned by someone else
+    except OSError:
+        return False
+    return True
+
+
+def _is_monitor_proc(pid):
+    """Guard against pid reuse: True unless ps says this pid is clearly not us.
+
+    If ps can't tell us (rare), we assume it's the dashboard rather than risk
+    spawning a duplicate — the worst case is focus_session() raising the wrong
+    window, which is far less annoying than a pile of stray monitors.
+    """
+    try:
+        out = subprocess.check_output(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            stderr=subprocess.DEVNULL, text=True)
+    except Exception:
+        return True
+    return "monitor.py" in out
+
+
+def _own_tty():
+    """This dashboard's controlling terminal (e.g. /dev/ttys003), or ''.
+
+    Unlike the hook — whose stdio Claude Code pipes — the dashboard owns a real
+    terminal, so os.ttyname works directly.
+    """
+    for fd in (0, 1, 2):
+        try:
+            return os.ttyname(fd)
+        except OSError:
+            pass
+    return ""
+
+
+def write_dashboard_lock():
+    """Record this dashboard's pid + terminal so the menu bar can find it.
+
+    Captures the same identifiers focus_session() needs (term_program, tty,
+    iterm/tmux ids). Best-effort: if this fails the only cost is the menu bar
+    possibly opening a second window.
+    """
+    try:
+        os.makedirs(ADHD_HOME, exist_ok=True)
+        with open(DASHBOARD_LOCK, "w") as f:
+            json.dump({
+                "pid": os.getpid(),
+                "term": {
+                    "term_program": os.environ.get("TERM_PROGRAM", ""),
+                    "tmux_pane": os.environ.get("TMUX_PANE", ""),
+                    "iterm_session_id": os.environ.get("ITERM_SESSION_ID", ""),
+                    "tty": _own_tty(),
+                },
+            }, f)
+    except OSError:
+        pass
+
+
+def clear_dashboard_lock():
+    """Remove our marker on exit — but only if it's still ours (pid match)."""
+    try:
+        with open(DASHBOARD_LOCK) as f:
+            if json.load(f).get("pid") != os.getpid():
+                return
+    except (OSError, ValueError):
+        return
+    try:
+        os.remove(DASHBOARD_LOCK)
+    except OSError:
+        pass
+
+
+def dashboard_session():
+    """A focus target for an already-running dashboard, or None.
+
+    Reads the marker, confirms its process is still alive (and really a
+    monitor.py, guarding pid reuse), and returns a session-shaped dict that
+    focus_session() understands. A stale marker (process gone) reads as None, so
+    the caller transparently falls back to launching a fresh window.
+    """
+    try:
+        with open(DASHBOARD_LOCK) as f:
+            info = json.load(f)
+    except (OSError, ValueError):
+        return None
+    pid = info.get("pid")
+    if not isinstance(pid, int) or not _pid_alive(pid) or not _is_monitor_proc(pid):
+        return None
+    return {"term": info.get("term") or {}, "project": "adhd monitor"}
 
 
 def main(stdscr):
@@ -282,15 +514,21 @@ def main(stdscr):
             "done": curses.color_pair(3),
         }
 
-    selected_sid = None  # track selection by session id so sort churn is harmless
+    # Track selection by a stable key so the per-second resort never moves it.
+    selected_key = None
     status_msg = ""
     while True:
         sessions = load_sessions()
-        ids = [s.get("session_id") for s in sessions]
-        if selected_sid not in ids:
-            selected_sid = ids[0] if ids else None
+        active_roots = {session_root(s) for s in sessions}
+        # Hide a project from "recently closed" while it's open again.
+        history = [e for e in load_history()
+                   if e.get("root") not in active_roots]
+        keys = (["s:" + (s.get("session_id") or "") for s in sessions]
+                + ["h:" + (e.get("root") or "") for e in history])
+        if selected_key not in keys:
+            selected_key = keys[0] if keys else None
 
-        draw(stdscr, colors, sessions, selected_sid, status_msg)
+        draw(stdscr, colors, sessions, history, selected_key, status_msg)
         try:
             ch = stdscr.getch()
         except KeyboardInterrupt:
@@ -304,19 +542,24 @@ def main(stdscr):
             clear_stale()
             continue
 
-        idx = ids.index(selected_sid) if selected_sid in ids else 0
-        if ch in (curses.KEY_DOWN, ord("j")) and ids:
-            selected_sid = ids[min(idx + 1, len(ids) - 1)]
+        idx = keys.index(selected_key) if selected_key in keys else 0
+        if ch in (curses.KEY_DOWN, ord("j")) and keys:
+            selected_key = keys[min(idx + 1, len(keys) - 1)]
             status_msg = ""
-        elif ch in (curses.KEY_UP, ord("k")) and ids:
-            selected_sid = ids[max(idx - 1, 0)]
+        elif ch in (curses.KEY_UP, ord("k")) and keys:
+            selected_key = keys[max(idx - 1, 0)]
             status_msg = ""
-        elif ch in (curses.KEY_ENTER, 10, 13) and selected_sid in ids:
-            status_msg = focus_session(sessions[idx])
+        elif ch in (curses.KEY_ENTER, 10, 13) and selected_key:
+            status_msg = _activate(selected_key, sessions, history)
+        elif ch in (ord("r"), ord("R")) and selected_key:
+            status_msg = _activate(selected_key, sessions, history, reopen_only=True)
 
 
 if __name__ == "__main__":
+    write_dashboard_lock()  # so the menu bar focuses this window, not a new one
     try:
         curses.wrapper(main)
     except KeyboardInterrupt:
         pass
+    finally:
+        clear_dashboard_lock()

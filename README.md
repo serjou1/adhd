@@ -121,8 +121,9 @@ Rows are sorted so WAITING is always at the top.
 
 | Key | Action |
 |-----|--------|
-| `↑` / `↓` (or `k` / `j`) | Move the selection (highlighted row) |
-| `⏎` Enter | Jump to / focus the terminal window running the selected session |
+| `↑` / `↓` (or `k` / `j`) | Move the selection (spans live sessions **and** recently-closed rows) |
+| `⏎` Enter | Live row → focus its window. Recently-closed row → re-open the project |
+| `r` | Re-open the selected recently-closed project |
 | `c` | Clear stale entries (sessions older than 6h that never sent a clean exit) |
 | `q` | Quit the dashboard |
 
@@ -152,6 +153,23 @@ restart them (or just let them fire one more event) and they'll become jumpable.
 > `code` command on your PATH — in VS Code run *Shell Command: Install 'code'
 > command in PATH* if it's missing.
 
+### Recently closed (history)
+
+Below the live sessions the dashboard shows a **recently closed** section: the
+last 10 distinct projects whose sessions have ended. Select one and press `⏎`
+(or `r`) to **re-open** it — a fresh terminal window opens in that project's
+folder and runs `claude`, restarting its session. It uses iTerm if that's where
+the session lived, otherwise Terminal.app.
+
+A project is recorded as closed whether it ended cleanly (`SessionEnd`) or was
+killed/force-closed (the reaper notices its terminal is gone). The list lives in
+`~/.adhd/history.json` on disk, so it **survives restarts, updates, and power
+loss**: whatever was open before a crash lands in history the next time the
+dashboard runs and reaps its leftover state file. (Leftover files from before the
+last reboot are reaped on sight — their `tty` may have been reused, so trusting
+it would risk a stale or mis-targeted row.) A project that's open again is hidden
+from the list until it closes once more.
+
 ## How it works
 
 1. Claude Code fires **hooks** on lifecycle events (prompt submitted, tool about
@@ -170,17 +188,19 @@ Event → state mapping (in `hook.py`):
 | `PostToolUse`     | working              |
 | `Notification`    | **waiting** (permission) or idle (idle prompt) |
 | `Stop`            | idle (done)          |
-| `SessionEnd`      | removed from dashboard |
+| `SessionEnd`      | removed from dashboard, recorded in **recently closed** |
 
 ## Files
 
 | Path | Role |
 |------|------|
 | `install.py`              | One-shot installer: adds the `adhd` / `adhd-menu` commands, wires the hooks, installs `rumps` (`--login` adds a LaunchAgent). |
-| `hook.py`                 | Event handler; writes per-session state. Always exits 0 so it can't break a session. |
-| `monitor.py`              | The terminal dashboard (also the shared session-loading / window-focus layer). |
+| `hook.py`                 | Event handler; writes per-session state, records closes to history. Always exits 0 so it can't break a session. |
+| `monitor.py`              | The terminal dashboard (also the shared session-loading / window-focus / re-open layer). |
 | `menubar.py`              | The macOS menu-bar app. Reuses `monitor.py`'s loading + focus logic. |
+| `history.py`              | Recently-closed project store (load / record). Shared by `hook.py` and `monitor.py`. |
 | `~/.adhd/state/`          | One JSON file per live session (override with `ADHD_STATE_DIR`). |
+| `~/.adhd/history.json`    | The last 10 closed projects, for re-opening (survives restarts/power loss). |
 | `~/.claude/settings.json` | Holds the global `hooks` block that wires the events to `hook.py`. |
 
 ## Notes & troubleshooting
@@ -193,8 +213,10 @@ Event → state mapping (in `hook.py`):
   keyword matching in the `classify()` function in `hook.py`.
 - **A crashed/force-closed session lingers.** It never sends `SessionEnd`, but
   the monitor auto-reaps it: each refresh it drops any session whose terminal
-  (`tty`) no longer has a live `claude` process. Sessions whose tty wasn't
-  captured (or if the process list can't be read) are kept, and `c` still clears
-  anything with no update for 6h as a backstop.
+  (`tty`) no longer has a live `claude` process (and any left over from before
+  the last reboot). Reaped sessions are recorded in **recently closed** so you
+  can re-open them. Sessions whose tty wasn't captured (or if the process list
+  can't be read) are kept, and `c` still clears anything with no update for 6h as
+  a backstop.
 - **"No sessions reporting yet."** Normal when no Claude Code instances are
   running, or none have fired an event since install.

@@ -34,7 +34,8 @@ except ImportError:
 # Reuse the dashboard's data layer: loading + reaping + window focus all live in
 # monitor.py. Importing it has no side effects (curses only runs under its own
 # __main__), so the menu bar and the terminal dashboard never drift apart.
-from monitor import load_sessions, focus_session, fmt_age  # noqa: E402
+from monitor import (  # noqa: E402
+    load_sessions, focus_session, fmt_age, dashboard_session)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MONITOR = os.path.join(HERE, "monitor.py")
@@ -183,11 +184,18 @@ def notify(title, message, sound="Glass"):
 
 
 def open_monitor():
-    """Launch the curses dashboard in a new Terminal window.
+    """Focus the dashboard if it's already open, else launch it. Single-instance.
 
-    Prefer the installed `adhd` command (on PATH, so its shell sources the
-    profile); fall back to running monitor.py directly with this interpreter.
+    The dashboard records a marker (its pid + terminal) while it runs; if that
+    window is still alive we just raise it instead of spawning a duplicate.
+    Otherwise we start a fresh one — preferring the installed `adhd` command (on
+    PATH, so its shell sources the profile), falling back to monitor.py under
+    this interpreter.
     """
+    existing = dashboard_session()
+    if existing:
+        focus_session(existing)
+        return
     cmd = shutil.which("adhd") or "%s %s" % (sys.executable, MONITOR)
     # `do script` opens a new window and runs the command in it.
     script = (
