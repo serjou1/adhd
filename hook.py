@@ -72,9 +72,10 @@ def detect_terminal(cwd):
 def classify(data):
     """Return (state, detail) for the incoming event.
 
-    states: working | waiting | idle | done
+    states: working | waiting | limit | idle | done
       working -> actively processing (prompt/tool in flight)
       waiting -> blocked on a permission/approval prompt (needs YOU)
+      limit   -> blocked on a usage/rate limit, waiting for it to reset
       idle    -> finished a turn, sitting at the prompt for next input
       done    -> session ended (file is removed instead, see main)
     """
@@ -96,6 +97,12 @@ def classify(data):
         ntype = str(data.get("notification_type", ""))
         msg = str(data.get("message", ""))
         low = (ntype + " " + msg).lower()
+        # Usage/rate limit: blocked on the clock, not on a decision you can make
+        # right now. Keep it out of the "waiting" (needs-you) bucket so the
+        # dashboard doesn't flag it red like an approval prompt.
+        if "limit" in low and ("usage" in low or "rate" in low
+                               or "reset" in low or "reached" in low):
+            return "limit", msg or "usage limit reached"
         if "permission" in low or "approve" in low or "allow" in low or "needs your" in low:
             return "waiting", msg or "needs approval"
         if "waiting for your input" in low or "idle" in low:

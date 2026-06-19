@@ -43,9 +43,10 @@ python3 install.py --login    # ...or auto-start it at login
 Click the icon for a live menu:
 
 ```
-  1 waiting · 2 working · 4 idle
+  1 waiting · 1 limited · 2 working · 4 idle
   ───────────────────────────────
   🔴  arbitrage-core — Claude needs your permission (12s)
+  🟣  backtester — rate-limited (4m)
   🟡  statistics-service — ran Bash (1s)
   🟢  twitter-crawler — waiting for input (47s)
   ───────────────────────────────
@@ -72,6 +73,7 @@ matters:
 | A session **finishes its turn** (working → idle) | ✅ *project* — done |
 | A session **blocks on a permission prompt** (needs access) | 🔴 *project* needs you |
 | A blocked session is **still waiting** after 10 min (repeat reminders on) | 🔴 *project* still needs you |
+| A session **hits a usage / rate limit** (waiting for reset) | 🟣 *project* rate-limited |
 
 ![A macOS notification reading "adhd needs you — claude-code · main — waiting for approval"](docs/notification.png)
 
@@ -111,9 +113,10 @@ specific one when several need you, click the menu-bar icon and pick it there.
 
 ```
   Claude Code Monitor
-  4 running   1 waiting   2 working   1 idle
+  5 running   1 waiting   1 limited   2 working   1 idle
   STATE    PROJECT                DETAIL                       AGE  CWD
   WAITING  upbit-crawler          needs permission to use...   12s  /Users/serjou/upbit-crawler
+  LIMIT    backtester             usage limit reached           4m  /Users/serjou/backtester
   WORKING  arbitrage-core         ran Bash                      3s  /Users/serjou/arbitrage-core
   WORKING  statistics-service     Bash                          1s  /Users/serjou/statistics-service
   IDLE     twitter-crawler        waiting for input           47s  /Users/serjou/twitter-crawler
@@ -122,10 +125,11 @@ specific one when several need you, click the menu-bar icon and pick it there.
 | State              | Meaning                                                        | What to do        |
 |--------------------|----------------------------------------------------------------|-------------------|
 | **WAITING** (red)  | Blocked on a permission / approval prompt — needs your click   | Go to that one    |
+| **LIMIT** (magenta) | Hit a usage / rate limit — blocked on the clock, not on you   | Wait for reset, or switch session |
 | **WORKING** (yellow) | Actively processing a prompt or running a tool               | Leave it alone    |
 | **IDLE** (green)   | Finished its turn, sitting at the prompt for your next message | Free when you are |
 
-Rows are sorted so WAITING is always at the top.
+Rows are sorted so WAITING is at the top, then LIMIT, then the rest.
 
 ## Keys
 
@@ -196,7 +200,7 @@ Event → state mapping (in `hook.py`):
 | `UserPromptSubmit`| working              |
 | `PreToolUse`      | working (tool name)  |
 | `PostToolUse`     | working              |
-| `Notification`    | **waiting** (permission) or idle (idle prompt) |
+| `Notification`    | **waiting** (permission), **limit** (usage/rate limit), or idle (idle prompt) |
 | `Stop`            | idle (done)          |
 | `SessionEnd`      | removed from dashboard, recorded in **recently closed** |
 

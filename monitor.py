@@ -41,8 +41,9 @@ APP_NAME = {
 }
 
 # Ordering / styling per state.
-ORDER = {"waiting": 0, "working": 1, "idle": 2, "done": 2}
-LABEL = {"waiting": "WAITING", "working": "WORKING", "idle": "IDLE", "done": "IDLE"}
+ORDER = {"waiting": 0, "limit": 1, "working": 2, "idle": 3, "done": 3}
+LABEL = {"waiting": "WAITING", "limit": "LIMIT", "working": "WORKING",
+         "idle": "IDLE", "done": "IDLE"}
 
 
 def live_ttys():
@@ -300,7 +301,7 @@ def draw(stdscr, colors, sessions, history, selected_key, status_msg):
     h, w = stdscr.getmaxyx()
     stdscr.erase()
 
-    counts = {"waiting": 0, "working": 0, "idle": 0}
+    counts = {"waiting": 0, "limit": 0, "working": 0, "idle": 0}
     for s in sessions:
         st = s.get("state", "idle")
         counts["idle" if st == "done" else st] = counts.get("idle" if st == "done" else st, 0) + 1
@@ -308,6 +309,7 @@ def draw(stdscr, colors, sessions, history, selected_key, status_msg):
     title = "  Claude Code Monitor"
     summary = (f"{len(sessions)} running   "
                f"{counts['waiting']} waiting   "
+               f"{counts['limit']} limited   "
                f"{counts['working']} working   "
                f"{counts['idle']} idle")
     stdscr.addnstr(0, 0, title.ljust(w), w - 1, curses.A_BOLD)
@@ -507,8 +509,10 @@ def main(stdscr):
         curses.init_pair(1, curses.COLOR_RED, -1)
         curses.init_pair(2, curses.COLOR_YELLOW, -1)
         curses.init_pair(3, curses.COLOR_GREEN, -1)
+        curses.init_pair(4, curses.COLOR_MAGENTA, -1)
         colors = {
             "waiting": curses.color_pair(1),
+            "limit": curses.color_pair(4),
             "working": curses.color_pair(2),
             "idle": curses.color_pair(3),
             "done": curses.color_pair(3),
@@ -556,6 +560,14 @@ def main(stdscr):
 
 
 if __name__ == "__main__":
+    # Single-instance backstop: if a dashboard is already running, raise its
+    # window and bow out instead of stacking a second curses view. This holds no
+    # matter how we're launched — the menu bar, the `adhd` command, or a bare
+    # `python3 monitor.py`. Set ADHD_FORCE=1 to start a second one anyway.
+    existing = dashboard_session()
+    if existing and os.environ.get("ADHD_FORCE") != "1":
+        focus_session(existing)
+        raise SystemExit(0)
     write_dashboard_lock()  # so the menu bar focuses this window, not a new one
     try:
         curses.wrapper(main)

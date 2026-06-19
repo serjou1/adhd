@@ -60,8 +60,9 @@ try:
 except ValueError:
     REPEAT_AFTER = 600.0  # 10 minutes
 # Colored dot per state, used in the per-session menu rows.
-DOT = {"waiting": "🔴", "working": "🟡", "idle": "🟢", "done": "🟢"}
-LABEL = {"waiting": "waiting", "working": "working", "idle": "idle", "done": "idle"}
+DOT = {"waiting": "🔴", "limit": "🟣", "working": "🟡", "idle": "🟢", "done": "🟢"}
+LABEL = {"waiting": "waiting", "limit": "rate-limited", "working": "working",
+         "idle": "idle", "done": "idle"}
 
 
 def _osa_escape(s):
@@ -243,14 +244,16 @@ class AdhdMenuApp(rumps.App):
     def refresh(self, _):
         sessions = load_sessions()
         self._maybe_notify(sessions)
-        counts = {"waiting": 0, "working": 0, "idle": 0}
+        counts = {"waiting": 0, "limit": 0, "working": 0, "idle": 0}
         for s in sessions:
             st = s.get("state", "idle")
             st = "idle" if st == "done" else st
             counts[st] = counts.get(st, 0) + 1
 
         waiting = counts["waiting"]
-        # Badge: glyph alone when nothing needs you, glyph + count otherwise.
+        # Badge counts only sessions blocked on YOU (approval prompts). Rate-
+        # limited ones are stuck on the clock, not on an action, so they stay
+        # out of the badge and just show their own row/dot in the menu.
         self.title = "%s %d" % (ICON, waiting) if waiting else ICON
         self.menu.clear()
         self.menu.update(self._build_menu(sessions, counts))
@@ -285,6 +288,10 @@ class AdhdMenuApp(rumps.App):
                 notify("🔴 %s needs you" % proj, detail or "waiting for approval",
                        sound="Funk")
                 self.last_notified[sid] = now
+            elif st == "limit" and prev != "limit":
+                # One-shot: nothing to do but wait for the reset, so no repeat nag.
+                notify("🟣 %s rate-limited" % proj,
+                       detail or "waiting for usage limit to reset")
             elif st == "idle" and prev == "working":
                 notify("✅ %s — done" % proj, detail or "turn finished")
             elif (st == "waiting" and self.repeat_enabled
@@ -301,8 +308,9 @@ class AdhdMenuApp(rumps.App):
     def _build_menu(self, sessions, counts):
         items = []
 
-        summary = "%d waiting · %d working · %d idle" % (
-            counts["waiting"], counts["working"], counts["idle"])
+        summary = "%d waiting · %d limited · %d working · %d idle" % (
+            counts["waiting"], counts.get("limit", 0),
+            counts["working"], counts["idle"])
         header = rumps.MenuItem(summary)
         header.set_callback(None)  # disabled (grayed, non-clickable)
         items.append(header)
