@@ -54,6 +54,11 @@ def record_closed(session):
         "root": root,
         "cwd": session.get("cwd") or root,
         "term_program": term.get("term_program", ""),
+        # The closing session's id, so re-opening can `claude --resume <id>` the
+        # exact same conversation rather than starting a blank one. Deduping by
+        # root means an entry always carries the most recent session for that
+        # project. Empty for sessions closed before this field existed.
+        "session_id": session.get("session_id", ""),
         "closed": session.get("updated") or time.time(),
     }
     try:

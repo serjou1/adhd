@@ -6,7 +6,9 @@ grouped view: instances WAITING for your input float to the top, then the
 ones actively WORKING, then the idle/done ones. Run it in a spare terminal
 or tmux pane.
 
-Keys:  ↑/↓ (or j/k) select   ⏎ focus that session's window
+Keys:  ↑/↓ (or j/k) select   ⏎ focus a session / open a closed project
+       r  resume a closed project's previous conversation (⇧⏎ works too on
+          terminals that report modifier keys — not Terminal.app)
        c clear stale   q quit
 """
 import curses
@@ -44,6 +46,13 @@ APP_NAME = {
 ORDER = {"waiting": 0, "limit": 1, "working": 2, "idle": 3, "done": 3}
 LABEL = {"waiting": "WAITING", "limit": "LIMIT", "working": "WORKING",
          "idle": "IDLE", "done": "IDLE"}
+
+# Escape-sequence bodies (everything after the ESC) that mean Shift+⏎. Terminals
+# that report modifier keys send one of these; the two encodings cover xterm-style
+# modifyOtherKeys (CSI 27;2;13~) and the kitty keyboard protocol (CSI 13;2u). Most
+# terminals send a bare CR for Shift+⏎ and can't be told apart from ⏎ — `r` is the
+# universal resume key for those. See _read_escape() / main().
+SHIFT_ENTER = {"[27;2;13~", "[13;2u"}
 
 
 def live_ttys():
@@ -173,20 +182,41 @@ def _osa_str(s):
     return str(s).replace("\\", "\\\\").replace('"', '\\"')
 
 
-def open_project(entry):
-    """Re-open a recently-closed project: a fresh terminal running `claude` in it.
+def open_project(entry, resume=False):
+    """Re-open a recently-closed project where it lived.
 
-    `entry` is a history record (see history.py). Opens a new window — iTerm if
-    that's where the session lived, otherwise Terminal.app — that cd's into the
-    project root and execs `claude`, restarting that project's session. Returns a
-    short status string for the footer.
+    `entry` is a history record (see history.py). The destination follows the
+    editor the session ran in:
+      - vscode -> open the project folder in VS Code (`code <root>`); the user
+        resumes `claude` in the integrated terminal, which is where it lived.
+      - iTerm  -> a fresh iTerm window
+      - else   -> a fresh Terminal.app window
+    Terminal/iTerm windows `cd` into the root and exec `claude`. With
+    `resume=True` (Shift+⏎ / `r`) they exec `claude --resume <id>` instead,
+    bringing back the *exact* previous conversation; plain ⏎ starts a fresh one.
+    Returns a short status string for the footer.
     """
     root = entry.get("root") or entry.get("cwd") or ""
     proj = entry.get("project") or (os.path.basename(root.rstrip("/")) if root else "?")
     if not root or not os.path.isdir(root):
         return "can't re-open %s — folder is gone" % proj
+
+    # VS Code keeps its session in the integrated terminal, which we can't script
+    # into from out here — so honor "open vscode" by raising/opening the folder
+    # window and let the user resume claude there (its persisted state is intact).
+    if entry.get("term_program") == "vscode":
+        return focus_vscode_window(root, proj)
+
     claude = shutil.which("claude") or "claude"
-    run = "cd %s && exec %s" % (shlex.quote(root), shlex.quote(claude))
+    sid = entry.get("session_id") or ""
+    if resume and sid:
+        cmd = shlex.quote(claude) + " --resume " + shlex.quote(sid)
+        status = "resuming %s…" % proj
+    else:
+        cmd = shlex.quote(claude)
+        status = ("opening %s… (no saved session to resume)" % proj
+                  if resume else "opening %s…" % proj)
+    run = "cd %s && exec %s" % (shlex.quote(root), cmd)
     if entry.get("term_program") == "iTerm.app":
         # iTerm runs `command` via execvp (no shell), so wrap it in a login shell.
         ok = _osascript(
@@ -201,7 +231,7 @@ def open_project(entry):
             '  activate\n'
             '  do script "%s"\n'
             'end tell' % _osa_str(run))
-    return "re-opening %s…" % proj if ok else "couldn't re-open %s" % proj
+    return status if ok else "couldn't re-open %s" % proj
 
 
 def focus_vscode_window(root, project):
@@ -296,6 +326,62 @@ def focus_session(s):
     return "no window info for this session (restart it to capture)"
 
 
+def send_text_to_session(s, text):
+    """Type `text` (plus a Return) into session `s`'s live terminal. True on success.
+
+    Used by the menu bar's auto-resume: when a session is stuck on a usage limit,
+    we submit a short prompt to nudge it forward once the limit clears. We only
+    inject where we can target the exact pane/tab the session owns — tmux pane,
+    iTerm session id, or Terminal tab-by-tty — so a stray keystroke can never land
+    in some unrelated window. VS Code (no scriptable terminal) and the bare-app
+    fallback return False; the caller skips them rather than guess.
+    """
+    term = s.get("term") or {}
+    prog = term.get("term_program", "")
+    pane = term.get("tmux_pane", "")
+    iterm = term.get("iterm_session_id", "")
+    tty = term.get("tty", "")
+
+    # tmux: send the literal text to the pane, then Enter to submit it.
+    if pane:
+        ok = _run(["tmux", "send-keys", "-t", pane, "-l", text])
+        return _run(["tmux", "send-keys", "-t", pane, "Enter"]) and ok
+
+    # iTerm2: `write text` appends a newline, so it submits as one keystroke run.
+    if prog == "iTerm.app" and iterm:
+        guid = iterm.split(":", 1)[-1]
+        return _osascript(
+            'tell application "iTerm"\n'
+            '  repeat with w in windows\n'
+            '    repeat with t in tabs of w\n'
+            '      repeat with se in sessions of t\n'
+            '        if id of se is "%s" then\n'
+            '          tell se to write text "%s"\n'
+            '          return\n'
+            '        end if\n'
+            '      end repeat\n'
+            '    end repeat\n'
+            '  end repeat\n'
+            'end tell' % (guid, _osa_str(text)))
+
+    # Terminal.app: `do script ... in <tab>` types into that tab's running program
+    # (claude), not a new shell — matched by tty so it's the session's own tab.
+    if prog == "Apple_Terminal" and tty:
+        return _osascript(
+            'tell application "Terminal"\n'
+            '  repeat with w in windows\n'
+            '    repeat with t in tabs of w\n'
+            '      if tty of t is "%s" then\n'
+            '        do script "%s" in t\n'
+            '        return\n'
+            '      end if\n'
+            '    end repeat\n'
+            '  end repeat\n'
+            'end tell' % (tty, _osa_str(text)))
+
+    return False  # vscode / unknown: no safe way to target the input
+
+
 def draw(stdscr, colors, sessions, history, selected_key, status_msg):
     now = time.time()
     h, w = stdscr.getmaxyx()
@@ -348,9 +434,9 @@ def draw(stdscr, colors, sessions, history, selected_key, status_msg):
         stdscr.addnstr(row + 2, 2, "Start a session in any project (hooks must be installed).", w - 3, curses.A_DIM)
         row += 4
 
-    # Recently-closed projects (newest first). Select one and ⏎/r re-opens it:
-    # a fresh terminal running `claude` in that folder. Survives restarts and
-    # power-offs because it's read from history.json on disk.
+    # Recently-closed projects (newest first). Select one and ⏎ opens it fresh
+    # (or raises its VS Code window); r resumes its previous conversation.
+    # Survives restarts and power-offs — it's read from history.json on disk.
     if history and row < h - 1:
         row += 1  # spacer between the live sessions and the closed ones
         if row < h - 1:
@@ -376,27 +462,29 @@ def draw(stdscr, colors, sessions, history, selected_key, status_msg):
 
     if status_msg:
         stdscr.addnstr(h - 2, 0, ("  " + status_msg).ljust(w), w - 1, curses.A_DIM)
-    foot = "  ↑/↓ select   ⏎ focus / re-open   c clear stale   q quit"
+    foot = "  ↑/↓ select   ⏎ open/focus   r resume   c clear stale   q quit"
     stdscr.addnstr(h - 1, 0, foot.ljust(w), w - 1, curses.A_BOLD)
     stdscr.refresh()
 
 
-def _activate(key, sessions, history, reopen_only=False):
+def _activate(key, sessions, history, resume=False):
     """Act on the selected row: focus a live session, or re-open a closed project.
 
     Selection is tracked by a stable key ("s:<session_id>" or "h:<root>") so it
-    survives the per-second resort. ⏎ does the natural thing for whichever kind
-    of row is selected; `r` (reopen_only) ignores live sessions.
+    survives the per-second resort. Plain ⏎ does the natural thing for whichever
+    kind of row is selected — focus a live session, open a closed project fresh.
+    `resume` (Shift+⏎ / `r`) only changes closed rows: it brings back that
+    project's previous conversation. It's a no-op on a live row (already open).
     """
     if key.startswith("s:"):
-        if reopen_only:
-            return ""  # 'r' is for re-opening closed projects, not live rows
+        if resume:
+            return ""  # live session: nothing to resume, it's already running
         sid = key[2:]
         s = next((x for x in sessions if (x.get("session_id") or "") == sid), None)
         return focus_session(s) if s else ""
     root = key[2:]
     e = next((x for x in history if (x.get("root") or "") == root), None)
-    return open_project(e) if e else ""
+    return open_project(e, resume=resume) if e else ""
 
 
 def _pid_alive(pid):
@@ -498,6 +586,30 @@ def dashboard_session():
     return {"term": info.get("term") or {}, "project": "adhd monitor"}
 
 
+def _read_escape(stdscr):
+    """Collect the rest of an escape sequence after a bare ESC (27) was read.
+
+    Returns the sequence body (everything after the ESC), so the caller can match
+    keys curses doesn't decode itself — notably Shift+⏎, which terminals that
+    report modifiers send as a CSI sequence. Reads non-blocking (the bytes are
+    already buffered) and bounded, restoring the redraw timeout on the way out. A
+    lone ESC press just yields ''.
+    """
+    seq = ""
+    stdscr.timeout(0)  # non-blocking for the buffered tail of the sequence
+    try:
+        for _ in range(12):
+            c = stdscr.getch()
+            if c == -1 or c > 255:
+                break
+            seq += chr(c)
+            if 0x40 <= c <= 0x7e and c != 0x5b:  # CSI final byte (not the '[')
+                break
+    finally:
+        stdscr.timeout(int(REFRESH * 1000))  # restore the per-second redraw
+    return seq
+
+
 def main(stdscr):
     curses.curs_set(0)
     stdscr.keypad(True)  # decode arrow keys to curses.KEY_* codes
@@ -553,10 +665,13 @@ def main(stdscr):
         elif ch in (curses.KEY_UP, ord("k")) and keys:
             selected_key = keys[max(idx - 1, 0)]
             status_msg = ""
+        elif ch == 27:  # ESC: may begin a Shift+⏎ sequence on reporting terminals
+            if _read_escape(stdscr) in SHIFT_ENTER and selected_key:
+                status_msg = _activate(selected_key, sessions, history, resume=True)
         elif ch in (curses.KEY_ENTER, 10, 13) and selected_key:
-            status_msg = _activate(selected_key, sessions, history)
+            status_msg = _activate(selected_key, sessions, history)  # open / focus
         elif ch in (ord("r"), ord("R")) and selected_key:
-            status_msg = _activate(selected_key, sessions, history, reopen_only=True)
+            status_msg = _activate(selected_key, sessions, history, resume=True)
 
 
 if __name__ == "__main__":

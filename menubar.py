@@ -17,6 +17,7 @@ Requires `rumps` (a small PyObjC wrapper):  pip3 install rumps
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -35,7 +36,8 @@ except ImportError:
 # monitor.py. Importing it has no side effects (curses only runs under its own
 # __main__), so the menu bar and the terminal dashboard never drift apart.
 from monitor import (  # noqa: E402
-    load_sessions, focus_session, fmt_age, dashboard_session)
+    load_sessions, focus_session, fmt_age, dashboard_session,
+    send_text_to_session)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MONITOR = os.path.join(HERE, "monitor.py")
@@ -59,6 +61,18 @@ try:
     REPEAT_AFTER = max(1.0, float(os.environ.get("ADHD_NOTIFY_REPEAT_SECS", "600")))
 except ValueError:
     REPEAT_AFTER = 600.0  # 10 minutes
+# Auto-resume: when a session is stuck on a usage/rate limit, submit a short
+# prompt to push it forward once the limit clears / the network is back. OFF by
+# default — it types into your terminal, so you opt in. ADHD_RESUME_TEXT is what
+# gets sent; ADHD_AUTO_RESUME_SECS is the retry cooldown (a still-limited session
+# is nudged again after this, not every tick).
+RESUME_DEFAULT = os.environ.get("ADHD_AUTO_RESUME", "0") == "1"
+RESUME_TEXT = os.environ.get("ADHD_RESUME_TEXT", "continue")
+try:
+    RESUME_AFTER = max(10.0, float(os.environ.get("ADHD_AUTO_RESUME_SECS", "300")))
+except ValueError:
+    RESUME_AFTER = 300.0  # 5 minutes
+NET_CACHE_SECS = 15.0  # how long a connectivity probe result is trusted
 # Colored dot per state, used in the per-session menu rows.
 DOT = {"waiting": "🔴", "limit": "🟣", "working": "🟡", "idle": "🟢", "done": "🟢"}
 LABEL = {"waiting": "waiting", "limit": "rate-limited", "working": "working",
@@ -224,6 +238,29 @@ def open_monitor():
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+_net_cache = {"t": 0.0, "ok": False}
+
+
+def network_up():
+    """Best-effort: is the API reachable right now? Cached for NET_CACHE_SECS.
+
+    A short TCP connect to api.anthropic.com:443. The cache keeps a whole tick of
+    limited sessions to a single probe. On any error we report 'down', so
+    auto-resume waits for the connection rather than nudging into a dead link.
+    """
+    now = time.time()
+    if now - _net_cache["t"] < NET_CACHE_SECS:
+        return _net_cache["ok"]
+    ok = False
+    try:
+        socket.create_connection(("api.anthropic.com", 443), timeout=2).close()
+        ok = True
+    except OSError:
+        ok = False
+    _net_cache.update(t=now, ok=ok)
+    return ok
+
+
 class AdhdMenuApp(rumps.App):
     def __init__(self):
         # quit_button=None: we render our own Quit so it survives menu rebuilds.
@@ -231,12 +268,17 @@ class AdhdMenuApp(rumps.App):
         self.notify_enabled = NOTIFY_DEFAULT
         # Re-ping sessions left waiting; off makes every prompt a one-shot toast.
         self.repeat_enabled = REPEAT_DEFAULT
+        # Auto-proceed sessions stuck on a usage/rate limit (types into them).
+        self.resume_enabled = RESUME_DEFAULT
         # Last-seen state per session id, so we can spot transitions worth
         # announcing (turn finished, or newly blocked on a prompt).
         self.prev_state = {}
         # When we last toasted about each session id, so a still-waiting prompt
         # can be nudged again after REPEAT_AFTER. Cleared when it stops waiting.
         self.last_notified = {}
+        # Per-session limit bookkeeping for auto-resume: sid -> {last_try, tries}.
+        # Present only while a session is in the 'limit' state.
+        self.limited = {}
         self.timer = rumps.Timer(self.refresh, REFRESH)
         self.timer.start()
         self.refresh(None)
@@ -244,6 +286,7 @@ class AdhdMenuApp(rumps.App):
     def refresh(self, _):
         sessions = load_sessions()
         self._maybe_notify(sessions)
+        self._maybe_resume(sessions)
         counts = {"waiting": 0, "limit": 0, "working": 0, "idle": 0}
         for s in sessions:
             st = s.get("state", "idle")
@@ -305,6 +348,46 @@ class AdhdMenuApp(rumps.App):
                 del self.prev_state[sid]
                 self.last_notified.pop(sid, None)
 
+    def _maybe_resume(self, sessions):
+        """Auto-proceed sessions stuck on a usage/rate limit, when it's safe.
+
+        For each session in the 'limit' state we hold off a cooldown (RESUME_AFTER)
+        and confirm the network is reachable — so a limit caused by being offline
+        resumes when the connection returns, and a usage cap resumes after it
+        resets — then submit RESUME_TEXT into that session to push it forward.
+        Sessions we can't target precisely (vscode/unknown) are skipped by the
+        injector. The cooldown re-arms after each attempt, so a still-limited
+        session is retried later instead of hammered every tick; we toast only the
+        first nudge of an episode. Bookkeeping is dropped once it leaves 'limit'.
+        """
+        seen = set()
+        now = time.time()
+        for s in sessions:
+            if s.get("state") != "limit":
+                continue
+            sid = s.get("session_id")
+            seen.add(sid)
+            rec = self.limited.get(sid)
+            if rec is None:
+                # Just hit the limit: arm the cooldown but don't retry yet — an
+                # immediate nudge would only slam back into the same wall.
+                self.limited[sid] = {"last_try": now, "tries": 0}
+                continue
+            if not self.resume_enabled or now - rec["last_try"] < RESUME_AFTER:
+                continue
+            if not network_up():
+                continue  # offline: hold until the connection is back
+            rec["last_try"] = now  # re-arm whether or not the nudge lands
+            if send_text_to_session(s, RESUME_TEXT):
+                rec["tries"] += 1
+                if rec["tries"] == 1:
+                    notify("↩️ %s — resuming" % (s.get("project") or "?"),
+                           "sent “%s” to clear the limit" % RESUME_TEXT)
+        # Drop sessions no longer limited so a fresh limit re-arms from scratch.
+        for sid in list(self.limited):
+            if sid not in seen:
+                del self.limited[sid]
+
     def _build_menu(self, sessions, counts):
         items = []
 
@@ -341,6 +424,10 @@ class AdhdMenuApp(rumps.App):
         repeat = rumps.MenuItem(_repeat_label(), callback=self._toggle_repeat)
         repeat.state = 1 if self.repeat_enabled else 0
         items.append(repeat)
+        resume = rumps.MenuItem(
+            "Auto-resume rate-limited", callback=self._toggle_resume)
+        resume.state = 1 if self.resume_enabled else 0
+        items.append(resume)
         items.append(rumps.separator)
         items.append(rumps.MenuItem("Quit", callback=rumps.quit_application))
         return items
@@ -350,6 +437,9 @@ class AdhdMenuApp(rumps.App):
 
     def _toggle_repeat(self, _):
         self.repeat_enabled = not self.repeat_enabled
+
+    def _toggle_resume(self, _):
+        self.resume_enabled = not self.resume_enabled
 
     def _make_focus(self, session):
         """Closure so each session row focuses its own window when clicked."""

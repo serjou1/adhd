@@ -24,6 +24,10 @@ MENUBAR = os.path.join(REPO, "menubar.py")
 SETTINGS = os.path.expanduser("~/.claude/settings.json")
 LAUNCH_AGENT = os.path.expanduser(
     "~/Library/LaunchAgents/com.adhd.menubar.plist")
+# launchd doesn't expand ~, so the plist gets this absolute path baked in. The
+# menu-bar app's stdout/stderr land here — so if it ever crashes or vanishes,
+# there's a trail instead of silence.
+LOG = os.path.expanduser("~/Library/Logs/adhd-menubar.log")
 
 # Events we hook and whether they take a "*" matcher.
 EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
@@ -78,6 +82,7 @@ def ensure_rumps():
 def install_login_item():
     """Auto-start adhd-menu at login via a LaunchAgent."""
     os.makedirs(os.path.dirname(LAUNCH_AGENT), exist_ok=True)
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
     plist = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
@@ -89,7 +94,9 @@ def install_login_item():
         '  </array>\n'
         '  <key>RunAtLoad</key><true/>\n'
         '  <key>KeepAlive</key><true/>\n'
-        '</dict></plist>\n' % (sys.executable, MENUBAR))
+        '  <key>StandardOutPath</key><string>%s</string>\n'
+        '  <key>StandardErrorPath</key><string>%s</string>\n'
+        '</dict></plist>\n' % (sys.executable, MENUBAR, LOG, LOG))
     with open(LAUNCH_AGENT, "w") as f:
         f.write(plist)
     subprocess.run(["launchctl", "unload", LAUNCH_AGENT],

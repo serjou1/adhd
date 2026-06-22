@@ -53,6 +53,7 @@ Click the icon for a live menu:
   Open adhd monitor…
   ✓ Notifications
   ✓ Repeat reminders (10 min)
+    Auto-resume rate-limited
   ───────────────────────────────
   Quit
 ```
@@ -87,6 +88,29 @@ instead of being lost. The moment the session stops waiting (you approve, or it
 moves on) the reminders stop. Toggle them from the menu (**Repeat reminders**),
 or start them off with `ADHD_NOTIFY_REPEAT=0`; change the interval (seconds)
 with `ADHD_NOTIFY_REPEAT_SECS`.
+
+### Auto-resume rate-limited sessions
+
+**Off by default.** Turn it on (menu → **Auto-resume rate-limited**, or start
+with `ADHD_AUTO_RESUME=1`) and `adhd` will pick a stalled session back up for
+you: when a session is blocked on a usage / rate limit, it waits out a cooldown,
+confirms the network is reachable, then **types a short prompt into that exact
+session** to push it forward. So a limit you hit while offline resumes when the
+connection returns, and a usage cap resumes after it resets — without you
+babysitting the terminal.
+
+It opts in because it *types into your terminal*. To stay safe it only nudges
+sessions it can target precisely — a tmux pane, an iTerm session id, or a
+Terminal tab matched by tty — so a keystroke can never land in the wrong window.
+VS Code sessions (no scriptable terminal) are left alone. A session that's still
+limited is retried after each cooldown, not hammered every tick, and only the
+first nudge of an episode toasts (**↩️ *project* — resuming**).
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ADHD_AUTO_RESUME` | `0` (off) | Set to `1` to start with auto-resume on |
+| `ADHD_RESUME_TEXT` | `continue` | The prompt typed into the session to resume it |
+| `ADHD_AUTO_RESUME_SECS` | `300` | Cooldown between retries while still limited (seconds) |
 
 Clicking a toast brings the waiting session's window to the front. To land on a
 specific one when several need you, click the menu-bar icon and pick it there.
@@ -136,8 +160,8 @@ Rows are sorted so WAITING is at the top, then LIMIT, then the rest.
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` (or `k` / `j`) | Move the selection (spans live sessions **and** recently-closed rows) |
-| `⏎` Enter | Live row → focus its window. Recently-closed row → re-open the project |
-| `r` | Re-open the selected recently-closed project |
+| `⏎` Enter | Live row → focus its window. Recently-closed row → open it fresh |
+| `r` | Recently-closed row → resume its previous conversation (`⇧⏎` works too on modifier-reporting terminals; see below) |
 | `c` | Clear stale entries (sessions older than 6h that never sent a clean exit) |
 | `q` | Quit the dashboard |
 
@@ -170,10 +194,27 @@ restart them (or just let them fire one more event) and they'll become jumpable.
 ### Recently closed (history)
 
 Below the live sessions the dashboard shows a **recently closed** section: the
-last 10 distinct projects whose sessions have ended. Select one and press `⏎`
-(or `r`) to **re-open** it — a fresh terminal window opens in that project's
-folder and runs `claude`, restarting its session. It uses iTerm if that's where
-the session lived, otherwise Terminal.app.
+last 10 distinct projects whose sessions have ended. Select one to re-open it
+**where it lived** — VS Code sessions re-open the project folder in VS Code
+(`code <root>`, the window the session ran in); iTerm / Terminal sessions open a
+fresh window in that app, `cd`'d into the project root.
+
+Two ways to re-open, so resuming is a deliberate choice:
+
+| Key | Does |
+|-----|------|
+| `⏎` | **Open** a fresh `claude` in the project (a clean slate) |
+| `r` | **Resume** — `claude --resume <session_id>`, bringing back the *exact* previous conversation (`⇧⏎` also works on modifier-reporting terminals) |
+
+The session id is remembered in the history entry (alongside the project root
+and the terminal it ran in), which is what makes resume possible. VS Code
+sessions always just open the folder — resume `claude` yourself in its
+integrated terminal, where the session lived.
+
+> **Heads-up on `⇧⏎`:** most terminals (Terminal.app, default iTerm2) send the
+> *same* byte for `⏎` and `⇧⏎`, so they can't be told apart unless the terminal
+> reports modifier keys (kitty, or iTerm2/xterm with CSI-u / *modifyOtherKeys*
+> enabled). **`r` always works** — use it if `⇧⏎` opens fresh on your terminal.
 
 A project is recorded as closed whether it ended cleanly (`SessionEnd`) or was
 killed/force-closed (the reaper notices its terminal is gone). The list lives in
