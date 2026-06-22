@@ -14,6 +14,7 @@ Run it:   adhd-menu      (after install.py)
 
 Requires `rumps` (a small PyObjC wrapper):  pip3 install rumps
 """
+import json
 import os
 import shlex
 import shutil
@@ -48,6 +49,11 @@ MONITOR = os.path.join(HERE, "monitor.py")
 ADHD_HOME = os.path.join(os.path.expanduser("~"), ".adhd")
 NOTIFIER_APP = os.path.join(ADHD_HOME, "adhd.app")
 PENDING = os.path.join(ADHD_HOME, "pending_notify")  # one queued toast payload
+# Persisted menu toggles. The app runs under launchd, which ignores your shell
+# env — so ADHD_* vars never reach it and an in-memory toggle would reset on
+# every restart. Storing the toggles here is the only thing that makes them
+# stick across logins / KeepAlive restarts. See load_config()/save_config().
+CONFIG_PATH = os.path.join(ADHD_HOME, "config.json")
 REFRESH = 1.0  # seconds between badge/menu refreshes
 # Menu-bar glyph shown next to the badge. Override with ADHD_MENU_ICON.
 ICON = os.environ.get("ADHD_MENU_ICON", "◧")
@@ -261,15 +267,40 @@ def network_up():
     return ok
 
 
+def load_config():
+    """Read persisted menu toggles. Missing/corrupt file -> {} (use defaults)."""
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    """Persist menu toggles atomically so they survive restarts/reboots."""
+    try:
+        os.makedirs(ADHD_HOME, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=ADHD_HOME, suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(cfg, f)
+        os.replace(tmp, CONFIG_PATH)
+    except OSError:
+        pass
+
+
 class AdhdMenuApp(rumps.App):
     def __init__(self):
         # quit_button=None: we render our own Quit so it survives menu rebuilds.
         super().__init__("adhd", title=ICON, quit_button=None)
-        self.notify_enabled = NOTIFY_DEFAULT
+        # Toggles persist to config.json (env defaults only seed a first run) —
+        # without this they'd reset every launchd restart, which is exactly why
+        # auto-resume never appeared to work.
+        cfg = load_config()
+        self.notify_enabled = cfg.get("notify", NOTIFY_DEFAULT)
         # Re-ping sessions left waiting; off makes every prompt a one-shot toast.
-        self.repeat_enabled = REPEAT_DEFAULT
+        self.repeat_enabled = cfg.get("repeat", REPEAT_DEFAULT)
         # Auto-proceed sessions stuck on a usage/rate limit (types into them).
-        self.resume_enabled = RESUME_DEFAULT
+        self.resume_enabled = cfg.get("auto_resume", RESUME_DEFAULT)
         # Last-seen state per session id, so we can spot transitions worth
         # announcing (turn finished, or newly blocked on a prompt).
         self.prev_state = {}
@@ -434,12 +465,20 @@ class AdhdMenuApp(rumps.App):
 
     def _toggle_notify(self, _):
         self.notify_enabled = not self.notify_enabled
+        self._save_config()
 
     def _toggle_repeat(self, _):
         self.repeat_enabled = not self.repeat_enabled
+        self._save_config()
 
     def _toggle_resume(self, _):
         self.resume_enabled = not self.resume_enabled
+        self._save_config()
+
+    def _save_config(self):
+        save_config({"notify": self.notify_enabled,
+                     "repeat": self.repeat_enabled,
+                     "auto_resume": self.resume_enabled})
 
     def _make_focus(self, session):
         """Closure so each session row focuses its own window when clicked."""

@@ -91,8 +91,9 @@ with `ADHD_NOTIFY_REPEAT_SECS`.
 
 ### Auto-resume rate-limited sessions
 
-**Off by default.** Turn it on (menu → **Auto-resume rate-limited**, or start
-with `ADHD_AUTO_RESUME=1`) and `adhd` will pick a stalled session back up for
+**Off by default.** Turn it on from the menu (**Auto-resume rate-limited**) —
+the choice is saved to `~/.adhd/config.json`, so it **sticks across restarts and
+reboots**. `adhd` then picks a stalled session back up for
 you: when a session is blocked on a usage / rate limit, it waits out a cooldown,
 confirms the network is reachable, then **types a short prompt into that exact
 session** to push it forward. So a limit you hit while offline resumes when the
@@ -108,7 +109,7 @@ first nudge of an episode toasts (**↩️ *project* — resuming**).
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `ADHD_AUTO_RESUME` | `0` (off) | Set to `1` to start with auto-resume on |
+| `ADHD_AUTO_RESUME` | `0` (off) | Seeds the *first* run only. The login-item app runs under launchd, which ignores your shell env, so this var never reaches it — enable it with the menu toggle (which now persists) |
 | `ADHD_RESUME_TEXT` | `continue` | The prompt typed into the session to resume it |
 | `ADHD_AUTO_RESUME_SECS` | `300` | Cooldown between retries while still limited (seconds) |
 
