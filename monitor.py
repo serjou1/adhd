@@ -182,6 +182,23 @@ def _osa_str(s):
     return str(s).replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _session_exists(sid):
+    """True if a transcript for `sid` is still on disk in claude's session store.
+
+    Recorded history can outlive the conversation it points at — transcripts get
+    cleared or rotated, and older entries predate session_id capture entirely. A
+    `claude --resume <deadid>` just errors with "No conversation found" in a fresh
+    window that then dies, which reads as "r does nothing". Checking first lets
+    open_project fall back to --continue. Globs every project dir so we needn't
+    reproduce claude's cwd->dir-name encoding.
+    """
+    if not sid:
+        return False
+    pattern = os.path.join(
+        os.path.expanduser("~"), ".claude", "projects", "*", sid + ".jsonl")
+    return bool(glob.glob(pattern))
+
+
 def open_project(entry, resume=False):
     """Re-open a recently-closed project where it lived.
 
@@ -192,8 +209,9 @@ def open_project(entry, resume=False):
       - iTerm  -> a fresh iTerm window
       - else   -> a fresh Terminal.app window
     Terminal/iTerm windows `cd` into the root and exec `claude`. With
-    `resume=True` (Shift+⏎ / `r`) they exec `claude --resume <id>` instead,
-    bringing back the *exact* previous conversation; plain ⏎ starts a fresh one.
+    `resume=True` (`r` / Shift+⏎) they exec `claude --resume <id>` to bring back
+    the *exact* previous conversation — or `claude --continue` (most recent in
+    that dir) when that conversation is gone; plain ⏎ starts a fresh one.
     Returns a short status string for the footer.
     """
     root = entry.get("root") or entry.get("cwd") or ""
@@ -209,13 +227,18 @@ def open_project(entry, resume=False):
 
     claude = shutil.which("claude") or "claude"
     sid = entry.get("session_id") or ""
-    if resume and sid:
+    if resume and _session_exists(sid):
         cmd = shlex.quote(claude) + " --resume " + shlex.quote(sid)
         status = "resuming %s…" % proj
+    elif resume:
+        # The exact conversation is gone (cleared/rotated) or was never captured.
+        # `--resume <deadid>` would error and leave a dead window, so fall back to
+        # --continue: the most recent conversation in this project's directory.
+        cmd = shlex.quote(claude) + " --continue"
+        status = "resuming %s… (latest)" % proj
     else:
         cmd = shlex.quote(claude)
-        status = ("opening %s… (no saved session to resume)" % proj
-                  if resume else "opening %s…" % proj)
+        status = "opening %s…" % proj
     run = "cd %s && exec %s" % (shlex.quote(root), cmd)
     if entry.get("term_program") == "iTerm.app":
         # iTerm runs `command` via execvp (no shell), so wrap it in a login shell.

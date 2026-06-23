@@ -90,6 +90,12 @@ def _osa_escape(s):
     return str(s).replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _clip(s, n):
+    """Trim `s` to at most `n` chars, ending in an ellipsis when shortened."""
+    s = str(s)
+    return s if len(s) <= n else s[: max(0, n - 1)].rstrip() + "…"
+
+
 def _repeat_label():
     """Menu label for the repeat toggle, showing the actual interval."""
     secs = int(REPEAT_AFTER)
@@ -328,7 +334,13 @@ class AdhdMenuApp(rumps.App):
         # Badge counts only sessions blocked on YOU (approval prompts). Rate-
         # limited ones are stuck on the clock, not on an action, so they stay
         # out of the badge and just show their own row/dot in the menu.
-        self.title = "%s %d" % (ICON, waiting) if waiting else ICON
+        badge = "%s %d" % (ICON, waiting) if waiting else ICON
+        # Lead with the most urgent session's chat title, so the menu bar shows
+        # WHAT needs you — not just a count. load_sessions() pre-sorts by urgency
+        # then recency, so sessions[0] is the one worth surfacing.
+        lead = sessions[0] if sessions else None
+        headline = (lead.get("title") or lead.get("project") or "") if lead else ""
+        self.title = "%s  %s" % (badge, _clip(headline, 40)) if headline else badge
         self.menu.clear()
         self.menu.update(self._build_menu(sessions, counts))
 
@@ -438,7 +450,11 @@ class AdhdMenuApp(rumps.App):
                 proj = s.get("project") or "?"
                 detail = s.get("detail") or LABEL.get(st, st)
                 age = fmt_age(now - s.get("updated", now))
-                title = "%s  %s — %s (%s)" % (dot, proj, detail, age)
+                # Show the chat title alongside the folder (proj · title) so rows
+                # say what each session is about, not just where it lives.
+                chat = s.get("title")
+                name = "%s · %s" % (proj, _clip(chat, 36)) if chat else proj
+                title = "%s  %s — %s (%s)" % (dot, name, detail, age)
                 item = rumps.MenuItem(title, callback=self._make_focus(s))
                 items.append(item)
         else:

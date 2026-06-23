@@ -69,6 +69,41 @@ def detect_terminal(cwd):
     }
 
 
+def read_title(transcript_path, fallback=""):
+    """The conversation's current Claude-generated title, or `fallback`.
+
+    Claude writes an `ai-title` line into the transcript each time it refreshes
+    the chat's title; the newest one is the live title. We scan only the tail of
+    the file (titles are rewritten as the chat grows, so a recent one sits near
+    the end) to stay cheap on every hook fire, and return `fallback` when the
+    path is missing or the tail holds no title — so a long run of tool calls
+    after the last title keeps showing the previous one instead of going blank.
+    """
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return fallback
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536))  # last 64 KiB is plenty for a recent title
+            tail = f.read().decode("utf-8", "replace")
+    except Exception:
+        return fallback
+    title = fallback
+    for line in tail.splitlines():
+        # We may have seeked into the middle of a line; a partial first line just
+        # fails to parse and is skipped. Cheap pre-filter before the json.loads.
+        if '"ai-title"' not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if obj.get("type") == "ai-title" and obj.get("aiTitle"):
+            title = obj["aiTitle"]
+    return title
+
+
 def classify(data):
     """Return (state, detail) for the incoming event.
 
@@ -138,14 +173,15 @@ def main():
     state, detail = classify(data)
     cwd = data.get("cwd") or os.getcwd()
 
-    # Reuse the terminal block captured on a prior event so we only pay the
-    # tty/ps lookup once per session, not on every hook fire.
-    term = None
+    # Reuse the terminal block (and last-known title) captured on a prior event so
+    # we only pay the tty/ps lookup once per session, not on every hook fire.
+    prev = {}
     try:
         with open(path) as f:
-            term = json.load(f).get("term")
+            prev = json.load(f)
     except Exception:
         pass
+    term = prev.get("term")
     if not term:
         term = detect_terminal(cwd)
     elif not term.get("root"):
@@ -156,6 +192,10 @@ def main():
         "session_id": sid,
         "cwd": cwd,
         "project": os.path.basename(root.rstrip("/")) or root,
+        # The chat's Claude-generated title, so the dashboard and menu bar can
+        # show WHAT a session is about, not just which folder it's in. Falls back
+        # to the previous title when this event's transcript tail has none.
+        "title": read_title(data.get("transcript_path", ""), prev.get("title", "")),
         "state": state,
         "detail": detail,
         "event": event,

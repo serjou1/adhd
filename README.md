@@ -31,7 +31,10 @@ automatically. No setup per project. Runtime state lives in `~/.adhd/state`
 
 Don't want a whole terminal pane? `adhd-menu` puts a status-bar icon up top with
 a badge counting the sessions **WAITING** on a permission prompt — the ones that
-literally need your click. `◧ 2` means two sessions are blocked.
+literally need your click. `◧ 2` means two sessions are blocked. Next to the
+badge it shows the **chat title** of the session that needs you most (Claude's
+own conversation title), so you can see *what's* waiting without opening the menu
+— and each dropdown row pairs the project folder with its chat title (`proj · title`).
 
 ![The menu-bar icon with a badge showing one waiting session](docs/menubar-badge.png)
 
@@ -205,7 +208,7 @@ Two ways to re-open, so resuming is a deliberate choice:
 | Key | Does |
 |-----|------|
 | `⏎` | **Open** a fresh `claude` in the project (a clean slate) |
-| `r` | **Resume** — `claude --resume <session_id>`, bringing back the *exact* previous conversation (`⇧⏎` also works on modifier-reporting terminals) |
+| `r` | **Resume** — `claude --resume <session_id>`, bringing back the *exact* previous conversation. If that conversation is gone (transcript cleared/rotated, or an older entry with no saved id), it falls back to `claude --continue` (the latest conversation in that project) instead of erroring out (`⇧⏎` also works on modifier-reporting terminals) |
 
 The session id is remembered in the history entry (alongside the project root
 and the terminal it ran in), which is what makes resume possible. VS Code
