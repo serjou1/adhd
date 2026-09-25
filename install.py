@@ -7,6 +7,10 @@ Does two things, both idempotent (safe to re-run):
 2. Wires Claude Code's lifecycle hooks (in ~/.claude/settings.json) to this
    repo's hook.py, so every session reports its state.
 
+Codex needs no wiring: it has no hooks, so the dashboard polls live `codex`
+processes and their rollout files at runtime instead (see codex.py). Nothing to
+install Codex-side.
+
 Run it from wherever you cloned the repo:
 
     python3 install.py

@@ -1,9 +1,9 @@
 # adhd
 
-A live terminal dashboard that shows every running Claude Code instance and its
-state, so you don't have to switch between projects to find the one stuck on a
-`yes / don't ask again` permission prompt. Select a session and hit Enter to jump
-straight to its window.
+A live terminal dashboard that shows every running **Claude Code and Codex**
+instance and its state, so you don't have to switch between projects to find the
+one stuck on a `yes / don't ask again` permission prompt. Select a session and
+hit Enter to jump straight to its window.
 
 ![The adhd dashboard listing running Claude Code sessions by state](docs/monitor.png)
 
@@ -27,14 +27,47 @@ That's it. It refreshes every second and picks up every Claude Code session
 automatically. No setup per project. Runtime state lives in `~/.adhd/state`
 (override with `ADHD_STATE_DIR`).
 
+## Codex sessions
+
+adhd tracks **Codex** (`codex` CLI) sessions too — with **zero setup**. Codex has
+no hook system like Claude Code's, so instead of being told, adhd **polls**: every
+refresh it finds the live `codex` processes and reads each one's rollout
+transcript (`~/.codex/sessions/…`) to work out what it's doing and what it's about.
+
+Codex rows are tagged **`cx`** (Claude rows are **`cc`**) so you can tell them
+apart at a glance, in both the dashboard and the menu bar. Everything else is the
+same — state, window focus, notifications, and **recently closed** with resume
+(`r` runs `codex resume <id>`, falling back to `codex resume --last`).
+
+| Signal | State |
+|--------|-------|
+| rollout: `task_started`, agent message / reasoning, tool call, web search | **working** |
+| rollout: a usage / rate limit | **limit** |
+| rollout: `task_complete` / `turn_aborted` | **idle** |
+| terminal title shows **`Action Required`** (an approval prompt) | **waiting** |
+
+Codex only writes its *conversation* to the rollout — **approval prompts never
+land there**, so adhd reads those from the terminal **tab title** (the `[ ! ]
+Action Required` Codex sets when it needs your yes/no). That title check runs on
+Terminal.app and iTerm2; on other terminals a Codex session still shows
+working/idle from the rollout, just without the red **waiting** flag and badge.
+
+Because detection is by polling, a Codex session shows up only while `adhd` or
+`adhd-menu` is running — there's nothing to install into Codex and nothing left
+behind. It doesn't matter how Codex was launched (`codex`, a `codex-fugu`
+wrapper, …) — adhd matches the underlying `codex` process. Set
+`CODEX_SESSIONS_DIR` if your rollouts don't live in `~/.codex/sessions`.
+
 ## Menu bar (macOS)
 
 Don't want a whole terminal pane? `adhd-menu` puts a status-bar icon up top with
 a badge counting the sessions **WAITING** on a permission prompt — the ones that
 literally need your click. `◧ 2` means two sessions are blocked. Next to the
 badge it shows the **chat title** of the session that needs you most (Claude's
-own conversation title), so you can see *what's* waiting without opening the menu
-— and each dropdown row pairs the project folder with its chat title (`proj · title`).
+own conversation title, or a Codex session's latest prompt), so you can see
+*what's* waiting without opening the menu — and each dropdown row pairs the
+project folder with its chat title (`proj · title`), tagged `cc` / `cx` for the
+agent.
 
 ![The menu-bar icon with a badge showing one waiting session](docs/menubar-badge.png)
 
@@ -48,10 +81,10 @@ Click the icon for a live menu:
 ```
   1 waiting · 1 limited · 2 working · 4 idle
   ───────────────────────────────
-  🔴  arbitrage-core — Claude needs your permission (12s)
-  🟣  backtester — rate-limited (4m)
-  🟡  statistics-service — ran Bash (1s)
-  🟢  twitter-crawler — waiting for input (47s)
+  🔴  cc arbitrage-core — needs your permission (12s)
+  🟣  cc backtester — rate-limited (4m)
+  🟡  cx statistics-service — responding (1s)
+  🟢  cc twitter-crawler — waiting for input (47s)
   ───────────────────────────────
   Open adhd monitor…
   ✓ Notifications
@@ -140,15 +173,18 @@ specific one when several need you, click the menu-bar icon and pick it there.
 ## What you see
 
 ```
-  Claude Code Monitor
+  Agent Monitor (Claude · Codex)
   5 running   1 waiting   1 limited   2 working   1 idle
   STATE    PROJECT                DETAIL                       AGE  CWD
-  WAITING  upbit-crawler          needs permission to use...   12s  /Users/serjou/upbit-crawler
-  LIMIT    backtester             usage limit reached           4m  /Users/serjou/backtester
-  WORKING  arbitrage-core         ran Bash                      3s  /Users/serjou/arbitrage-core
-  WORKING  statistics-service     Bash                          1s  /Users/serjou/statistics-service
-  IDLE     twitter-crawler        waiting for input           47s  /Users/serjou/twitter-crawler
+  WAITING  cc upbit-crawler       needs permission to use...   12s  /Users/serjou/upbit-crawler
+  LIMIT    cc backtester          usage limit reached           4m  /Users/serjou/backtester
+  WORKING  cx arbitrage-core      responding                    3s  /Users/serjou/arbitrage-core
+  WORKING  cc statistics-service  Bash                          1s  /Users/serjou/statistics-service
+  IDLE     cc twitter-crawler     waiting for input           47s  /Users/serjou/twitter-crawler
 ```
+
+The `cc` / `cx` prefix on each `PROJECT` is the agent — **`cc`** Claude Code,
+**`cx`** Codex.
 
 | State              | Meaning                                                        | What to do        |
 |--------------------|----------------------------------------------------------------|-------------------|
@@ -207,8 +243,8 @@ Two ways to re-open, so resuming is a deliberate choice:
 
 | Key | Does |
 |-----|------|
-| `⏎` | **Open** a fresh `claude` in the project (a clean slate) |
-| `r` | **Resume** — `claude --resume <session_id>`, bringing back the *exact* previous conversation. If that conversation is gone (transcript cleared/rotated, or an older entry with no saved id), it falls back to `claude --continue` (the latest conversation in that project) instead of erroring out (`⇧⏎` also works on modifier-reporting terminals) |
+| `⏎` | **Open** a fresh `claude` (or `codex`) in the project (a clean slate) |
+| `r` | **Resume** — `claude --resume <session_id>` (or `codex resume <session_id>` for a Codex row), bringing back the *exact* previous conversation. If that conversation is gone (transcript cleared/rotated, or an older entry with no saved id), it falls back to `claude --continue` / `codex resume --last` (the latest conversation in that project) instead of erroring out (`⇧⏎` also works on modifier-reporting terminals) |
 
 The session id is remembered in the history entry (alongside the project root
 and the terminal it ran in), which is what makes resume possible. VS Code
@@ -249,15 +285,23 @@ Event → state mapping (in `hook.py`):
 | `Stop`            | idle (done)          |
 | `SessionEnd`      | removed from dashboard, recorded in **recently closed** |
 
+**Codex** has no hooks, so it's handled the other way around: `codex.py` polls
+the live `codex` processes and their rollout files on each refresh and builds the
+same records on the fly (tagged `tool: "codex"`), which flow through the same
+loading, focus, and notification code. See **Codex sessions** above for its event
+mapping.
+
 ## Files
 
 | Path | Role |
 |------|------|
 | `install.py`              | One-shot installer: adds the `adhd` / `adhd-menu` commands, wires the hooks, installs `rumps` (`--login` adds a LaunchAgent). |
-| `hook.py`                 | Event handler; writes per-session state, records closes to history. Always exits 0 so it can't break a session. |
+| `hook.py`                 | Claude Code event handler; writes per-session state, records closes to history. Always exits 0 so it can't break a session. |
+| `codex.py`                | Polls live Codex sessions (process list + rollout files) into the same records, so Codex shows up with no hooks. |
 | `monitor.py`              | The terminal dashboard (also the shared session-loading / window-focus / re-open layer). |
 | `menubar.py`              | The macOS menu-bar app. Reuses `monitor.py`'s loading + focus logic. |
-| `history.py`              | Recently-closed project store (load / record). Shared by `hook.py` and `monitor.py`. |
+| `history.py`              | Recently-closed project store (load / record). Shared by `hook.py`, `codex.py`, and `monitor.py`. |
+| `~/.codex/sessions/`      | Codex's own rollout transcripts — adhd reads them to detect Codex state (override with `CODEX_SESSIONS_DIR`). |
 | `~/.adhd/state/`          | One JSON file per live session (override with `ADHD_STATE_DIR`). |
 | `~/.adhd/history.json`    | The last 10 closed projects, for re-opening (survives restarts/power loss). |
 | `~/.claude/settings.json` | Holds the global `hooks` block that wires the events to `hook.py`. |
@@ -277,5 +321,10 @@ Event → state mapping (in `hook.py`):
   can re-open them. Sessions whose tty wasn't captured (or if the process list
   can't be read) are kept, and `c` still clears anything with no update for 6h as
   a backstop.
-- **"No sessions reporting yet."** Normal when no Claude Code instances are
-  running, or none have fired an event since install.
+- **A Codex session isn't showing?** Codex is detected by polling, so it only
+  appears while `adhd` or `adhd-menu` is running (and the row updates each
+  refresh). Make sure the `codex` process is alive and its rollout is under
+  `~/.codex/sessions` — or point `CODEX_SESSIONS_DIR` at the right place. There's
+  nothing to install into Codex itself.
+- **"No sessions reporting yet."** Normal when no Claude Code or Codex instances
+  are running, or no Claude session has fired an event since install.

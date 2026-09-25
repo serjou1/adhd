@@ -59,6 +59,10 @@ def record_closed(session):
         # root means an entry always carries the most recent session for that
         # project. Empty for sessions closed before this field existed.
         "session_id": session.get("session_id", ""),
+        # Which agent owned this session, so re-opening routes to the right CLI
+        # (`claude --resume` vs `codex resume`). Absent on pre-existing entries —
+        # treated as "claude" by readers, matching the original behaviour.
+        "tool": session.get("tool") or "claude",
         "closed": session.get("updated") or time.time(),
     }
     try:

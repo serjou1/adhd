@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import time
 
+from codex import codex_sessions
 from history import load_history, record_closed
 
 STATE_DIR = os.environ.get("ADHD_STATE_DIR") or os.path.join(
@@ -47,6 +48,15 @@ ORDER = {"waiting": 0, "limit": 1, "working": 2, "idle": 3, "done": 3}
 LABEL = {"waiting": "WAITING", "limit": "LIMIT", "working": "WORKING",
          "idle": "IDLE", "done": "IDLE"}
 
+# Short per-agent tag shown on each row so Claude and Codex sessions are tellable
+# apart at a glance. A record's "tool" is "codex" for Codex sessions (set by
+# codex.py) and absent — i.e. "claude" — for Claude ones.
+TOOL_TAG = {"claude": "cc", "codex": "cx"}
+
+
+def tool_tag(tool):
+    return TOOL_TAG.get(tool or "claude", "??")
+
 # Escape-sequence bodies (everything after the ESC) that mean Shift+⏎. Terminals
 # that report modifier keys send one of these; the two encodings cover xterm-style
 # modifyOtherKeys (CSI 27;2;13~) and the kitty keyboard protocol (CSI 13;2u). Most
@@ -55,15 +65,34 @@ LABEL = {"waiting": "WAITING", "limit": "LIMIT", "working": "WORKING",
 SHIFT_ENTER = {"[27;2;13~", "[13;2u"}
 
 
+# Absolute path so subprocess can use posix_spawn instead of fork()+exec() —
+# see live_ttys() for why that matters in the menu-bar process.
+_PS = shutil.which("ps") or "/bin/ps"
+# Same reason: send_text_to_session / focus_session run osascript from the
+# menu-bar's AppKit timer (auto-resume, focus), and a fork() there can break the
+# status item's WindowServer link and blank the icon. Absolute path + the
+# close_fds=False in _run() keep these on the fork-free posix_spawn branch.
+_OSASCRIPT = shutil.which("osascript") or "/usr/bin/osascript"
+
+
 def live_ttys():
     """TTYs that currently host a live `claude` process.
 
     Returns a set like {"ttys000", ...}, or None if we couldn't tell (in which
     case callers must not prune — better a stale row than dropping a live one).
+
+    The menu-bar app (menubar.py) calls this from its AppKit run loop on every
+    refresh, so this MUST NOT fork(): forking a process that owns an
+    NSStatusItem intermittently breaks its WindowServer connection and the icon
+    silently vanishes while the process keeps running (KeepAlive can't catch it
+    because nothing crashed). Passing an absolute exe path + close_fds=False
+    makes CPython take the posix_spawn branch — the same fork-free path NSTask
+    uses — which is safe inside a GUI run loop.
     """
     try:
-        out = subprocess.run(["ps", "-axo", "tty=,comm="],
-                             stdout=subprocess.PIPE, text=True).stdout
+        out = subprocess.run([_PS, "-axo", "tty=,comm="],
+                             stdout=subprocess.PIPE, text=True,
+                             close_fds=False).stdout
     except Exception:
         return None
     ttys = set()
@@ -139,6 +168,10 @@ def load_sessions():
             _reap(fp, r)  # its terminal is gone
             continue
         out.append(r)
+    # Codex sessions aren't state files (Codex has no hooks) — they're polled
+    # live from the process list + rollout files, so they need no reaping: a
+    # session that exits just stops appearing. Merge them in and sort together.
+    out.extend(codex_sessions())
     out.sort(key=lambda r: (ORDER.get(r.get("state"), 3), -r.get("updated", 0)))
     return out
 
@@ -165,16 +198,21 @@ def clear_stale():
 
 
 def _run(cmd):
-    """Run a command silently; return True on exit 0."""
+    """Run a command silently; return True on exit 0.
+
+    close_fds=False (plus an absolute exe in cmd[0]) keeps CPython on the
+    posix_spawn branch instead of fork()+exec — see the _OSASCRIPT note above.
+    """
     try:
         return subprocess.run(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=False).returncode == 0
     except Exception:
         return False
 
 
 def _osascript(script):
-    return _run(["osascript", "-e", script])
+    return _run([_OSASCRIPT, "-e", script])
 
 
 def _osa_str(s):
@@ -199,6 +237,21 @@ def _session_exists(sid):
     return bool(glob.glob(pattern))
 
 
+def _codex_session_exists(sid):
+    """True if a Codex rollout for `sid` is still on disk.
+
+    The Codex analogue of _session_exists: lets open_project fall back to
+    `codex resume --last` when the exact session's rollout was rotated away,
+    instead of firing `codex resume <deadid>` into a window that just errors.
+    """
+    if not sid:
+        return False
+    pattern = os.path.join(
+        os.path.expanduser("~"), ".codex", "sessions", "*", "*", "*",
+        "rollout-*-" + sid + ".jsonl")
+    return bool(glob.glob(pattern))
+
+
 def open_project(entry, resume=False):
     """Re-open a recently-closed project where it lived.
 
@@ -208,11 +261,12 @@ def open_project(entry, resume=False):
         resumes `claude` in the integrated terminal, which is where it lived.
       - iTerm  -> a fresh iTerm window
       - else   -> a fresh Terminal.app window
-    Terminal/iTerm windows `cd` into the root and exec `claude`. With
-    `resume=True` (`r` / Shift+⏎) they exec `claude --resume <id>` to bring back
-    the *exact* previous conversation — or `claude --continue` (most recent in
-    that dir) when that conversation is gone; plain ⏎ starts a fresh one.
-    Returns a short status string for the footer.
+    Terminal/iTerm windows `cd` into the root and exec the session's agent —
+    `claude` or, for a Codex history entry (entry["tool"] == "codex"), `codex`.
+    With `resume=True` (`r` / Shift+⏎) they bring back the *exact* previous
+    conversation (`claude --resume <id>` / `codex resume <id>`), or its latest
+    fallback (`claude --continue` / `codex resume --last`) when that conversation
+    is gone; plain ⏎ starts a fresh one. Returns a status string for the footer.
     """
     root = entry.get("root") or entry.get("cwd") or ""
     proj = entry.get("project") or (os.path.basename(root.rstrip("/")) if root else "?")
@@ -225,20 +279,34 @@ def open_project(entry, resume=False):
     if entry.get("term_program") == "vscode":
         return focus_vscode_window(root, proj)
 
-    claude = shutil.which("claude") or "claude"
     sid = entry.get("session_id") or ""
-    if resume and _session_exists(sid):
-        cmd = shlex.quote(claude) + " --resume " + shlex.quote(sid)
-        status = "resuming %s…" % proj
-    elif resume:
-        # The exact conversation is gone (cleared/rotated) or was never captured.
-        # `--resume <deadid>` would error and leave a dead window, so fall back to
-        # --continue: the most recent conversation in this project's directory.
-        cmd = shlex.quote(claude) + " --continue"
-        status = "resuming %s… (latest)" % proj
+    if (entry.get("tool") or "claude") == "codex":
+        codex = shutil.which("codex") or "codex"
+        if resume and _codex_session_exists(sid):
+            cmd = shlex.quote(codex) + " resume " + shlex.quote(sid)
+            status = "resuming %s…" % proj
+        elif resume:
+            # The exact session's rollout is gone (rotated) or was never captured;
+            # `resume <deadid>` would error, so fall back to the most recent one.
+            cmd = shlex.quote(codex) + " resume --last"
+            status = "resuming %s… (latest)" % proj
+        else:
+            cmd = shlex.quote(codex)
+            status = "opening %s…" % proj
     else:
-        cmd = shlex.quote(claude)
-        status = "opening %s…" % proj
+        claude = shutil.which("claude") or "claude"
+        if resume and _session_exists(sid):
+            cmd = shlex.quote(claude) + " --resume " + shlex.quote(sid)
+            status = "resuming %s…" % proj
+        elif resume:
+            # The exact conversation is gone (cleared/rotated) or was never
+            # captured. `--resume <deadid>` would error and leave a dead window,
+            # so fall back to --continue: the most recent one in this dir.
+            cmd = shlex.quote(claude) + " --continue"
+            status = "resuming %s… (latest)" % proj
+        else:
+            cmd = shlex.quote(claude)
+            status = "opening %s…" % proj
     run = "cd %s && exec %s" % (shlex.quote(root), cmd)
     if entry.get("term_program") == "iTerm.app":
         # iTerm runs `command` via execvp (no shell), so wrap it in a login shell.
@@ -415,7 +483,7 @@ def draw(stdscr, colors, sessions, history, selected_key, status_msg):
         st = s.get("state", "idle")
         counts["idle" if st == "done" else st] = counts.get("idle" if st == "done" else st, 0) + 1
 
-    title = "  Claude Code Monitor"
+    title = "  Agent Monitor (Claude · Codex)"
     summary = (f"{len(sessions)} running   "
                f"{counts['waiting']} waiting   "
                f"{counts['limit']} limited   "
@@ -441,7 +509,7 @@ def draw(stdscr, colors, sessions, history, selected_key, status_msg):
         if selected:
             attr |= curses.A_REVERSE
         marker = "▶ " if selected else "  "
-        proj = (s.get("project") or "?")[:22]
+        proj = ("%s %s" % (tool_tag(s.get("tool")), s.get("project") or "?"))[:22]
         detail = (s.get("detail") or "")[:26]
         age = fmt_age(now - s.get("updated", now))
         cwd = s.get("cwd") or ""
@@ -453,8 +521,8 @@ def draw(stdscr, colors, sessions, history, selected_key, status_msg):
         row += 1
 
     if not sessions:
-        stdscr.addnstr(row + 1, 2, "No Claude Code sessions reporting yet.", w - 3, curses.A_DIM)
-        stdscr.addnstr(row + 2, 2, "Start a session in any project (hooks must be installed).", w - 3, curses.A_DIM)
+        stdscr.addnstr(row + 1, 2, "No agent sessions reporting yet.", w - 3, curses.A_DIM)
+        stdscr.addnstr(row + 2, 2, "Start a Claude Code (hooks installed) or Codex session in any project.", w - 3, curses.A_DIM)
         row += 4
 
     # Recently-closed projects (newest first). Select one and ⏎ opens it fresh
@@ -472,7 +540,7 @@ def draw(stdscr, colors, sessions, history, selected_key, status_msg):
             selected = ("h:" + (e.get("root") or "")) == selected_key
             attr = curses.A_REVERSE if selected else curses.A_DIM
             marker = "▶ " if selected else "  "
-            proj = (e.get("project") or "?")[:22]
+            proj = ("%s %s" % (tool_tag(e.get("tool")), e.get("project") or "?"))[:22]
             age = fmt_age(now - e.get("closed", now))
             root = e.get("root") or ""
             detail = ("closed %s ago" % age)[:26]
