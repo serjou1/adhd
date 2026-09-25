@@ -38,7 +38,7 @@ except ImportError:
 # __main__), so the menu bar and the terminal dashboard never drift apart.
 from monitor import (  # noqa: E402
     load_sessions, focus_session, fmt_age, dashboard_session,
-    send_text_to_session)
+    send_text_to_session, tool_tag)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MONITOR = os.path.join(HERE, "monitor.py")
@@ -57,6 +57,29 @@ CONFIG_PATH = os.path.join(ADHD_HOME, "config.json")
 REFRESH = 1.0  # seconds between badge/menu refreshes
 # Menu-bar glyph shown next to the badge. Override with ADHD_MENU_ICON.
 ICON = os.environ.get("ADHD_MENU_ICON", "◧")
+
+# This process is an AppKit app (rumps). A fork()+exec() from its main thread —
+# which is where the refresh timer and menu actions run — intermittently breaks
+# the status item's link to the WindowServer, and the menu-bar icon silently
+# vanishes (the recurring "icon is gone" bug; see monitor.live_ttys and commit
+# d609fc3). CPython only avoids fork() when the exe is an absolute path AND
+# close_fds is False, so every subprocess we launch from the AppKit thread must
+# go through _spawn() with one of these absolute paths.
+_OSASCRIPT = shutil.which("osascript") or "/usr/bin/osascript"
+_OPEN = shutil.which("open") or "/usr/bin/open"
+
+
+def _spawn(cmd):
+    """Run cmd fork-free (posix_spawn), discard output, never raise.
+
+    Requires cmd[0] to be an absolute path (e.g. _OSASCRIPT/_OPEN) so CPython
+    takes the posix_spawn branch — see the note above.
+    """
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, close_fds=False)
+    except Exception:
+        pass
 # Notifications on by default; set ADHD_NOTIFY=0 to start with them muted.
 NOTIFY_DEFAULT = os.environ.get("ADHD_NOTIFY", "1") != "0"
 # Repeat reminders on by default: a session left waiting on a prompt gets pinged
@@ -96,6 +119,13 @@ def _clip(s, n):
     return s if len(s) <= n else s[: max(0, n - 1)].rstrip() + "…"
 
 
+def _session_label(s):
+    """Build "proj · chat title" for a session, or just "proj" if untitled."""
+    proj = "%s %s" % (tool_tag(s.get("tool")), s.get("project") or "?")
+    chat = s.get("title")
+    return "%s · %s" % (proj, _clip(chat, 36)) if chat else proj
+
+
 def _repeat_label():
     """Menu label for the repeat toggle, showing the actual interval."""
     secs = int(REPEAT_AFTER)
@@ -132,11 +162,17 @@ APPLET_SRC = r'''on doWork()
 end doWork
 
 on run
-	doWork()
+	try
+		doWork()
+	end try
+	quit me
 end run
 
 on reopen
-	doWork()
+	try
+		doWork()
+	end try
+	quit me
 end reopen
 '''
 
@@ -152,7 +188,8 @@ def ensure_notifier_app():
     """
     if os.path.isdir(NOTIFIER_APP):
         return True
-    if not shutil.which("osacompile"):
+    osacompile = shutil.which("osacompile")
+    if not osacompile:
         return False
     os.makedirs(ADHD_HOME, exist_ok=True)
     focus_cmd = "%s %s --focus >/dev/null 2>&1 &" % (
@@ -165,8 +202,9 @@ def ensure_notifier_app():
             f.write(src)
             tmp = f.name
         ok = subprocess.run(
-            ["osacompile", "-o", NOTIFIER_APP, tmp],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+            [osacompile, "-o", NOTIFIER_APP, tmp],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=False).returncode == 0
     except Exception:
         ok = False
     finally:
@@ -195,10 +233,13 @@ def _brand_notifier_app():
                 "Set :CFBundleName adhd",
                 "Add :LSUIElement bool true"):
         subprocess.run([pb, "-c", cmd, plist],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       close_fds=False)
     # Re-sign ad-hoc *after* editing Info.plist, or the signature is invalidated.
-    subprocess.run(["codesign", "--force", "--sign", "-", NOTIFIER_APP],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    codesign = shutil.which("codesign") or "/usr/bin/codesign"
+    subprocess.run([codesign, "--force", "--sign", "-", NOTIFIER_APP],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   close_fds=False)
 
 
 def notify(title, message, sound="Glass"):
@@ -209,21 +250,22 @@ def notify(title, message, sound="Glass"):
     toast — it still delivers; its click just opens Script Editor as before.
     """
     if not ensure_notifier_app():
-        subprocess.run(
-            ["osascript", "-e",
+        _spawn(
+            [_OSASCRIPT, "-e",
              'display notification "%s" with title "%s" sound name "%s"' % (
-                 _osa_escape(message), _osa_escape(title), sound)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                 _osa_escape(message), _osa_escape(title), sound)])
         return
     try:
         with open(PENDING, "w") as f:
             f.write("\x1f".join((title, message, sound)))
     except OSError:
         return
-    # -g: don't steal focus, -j: launch hidden. A fresh launch each time (the
-    # applet exits after posting), so `on run` re-reads the queued payload.
-    subprocess.run(["open", "-gj", NOTIFIER_APP],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # -g: don't steal focus, -j: launch hidden. The applet self-quits (`quit me`)
+    # right after posting, so every notify() is a fresh `on run` that re-reads the
+    # queued payload. This is load-bearing: a resident instance that stayed alive
+    # would only get a `reopen` event, and if it wedged it silently stopped posting
+    # (banners just stopped) — the exact failure this quit-on-post design prevents.
+    _spawn([_OPEN, "-gj", NOTIFIER_APP])
 
 
 def open_monitor():
@@ -246,8 +288,7 @@ def open_monitor():
         '  activate\n'
         '  do script "exec %s"\n'
         'end tell' % cmd.replace('"', '\\"'))
-    subprocess.run(["osascript", "-e", script],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _spawn([_OSASCRIPT, "-e", script])
 
 
 _net_cache = {"t": 0.0, "ok": False}
@@ -321,28 +362,41 @@ class AdhdMenuApp(rumps.App):
         self.refresh(None)
 
     def refresh(self, _):
-        sessions = load_sessions()
-        self._maybe_notify(sessions)
-        self._maybe_resume(sessions)
-        counts = {"waiting": 0, "limit": 0, "working": 0, "idle": 0}
-        for s in sessions:
-            st = s.get("state", "idle")
-            st = "idle" if st == "done" else st
-            counts[st] = counts.get(st, 0) + 1
+        # The icon *is* self.title, so set a guaranteed floor before doing any
+        # fallible work. If load_sessions()/notify/resume/menu-build raises this
+        # tick, the icon stays put (just without its badge for one tick) instead
+        # of vanishing — the long-standing "icon is gone" failure mode where an
+        # exception landed before the title was ever assigned. rumps only redraws
+        # after this callback returns, so the floor never visibly flickers.
+        self.title = ICON
+        try:
+            sessions = load_sessions()
+            self._maybe_notify(sessions)
+            self._maybe_resume(sessions)
+            counts = {"waiting": 0, "limit": 0, "working": 0, "idle": 0}
+            for s in sessions:
+                st = s.get("state", "idle")
+                st = "idle" if st == "done" else st
+                counts[st] = counts.get(st, 0) + 1
 
-        waiting = counts["waiting"]
-        # Badge counts only sessions blocked on YOU (approval prompts). Rate-
-        # limited ones are stuck on the clock, not on an action, so they stay
-        # out of the badge and just show their own row/dot in the menu.
-        badge = "%s %d" % (ICON, waiting) if waiting else ICON
-        # Lead with the most urgent session's chat title, so the menu bar shows
-        # WHAT needs you — not just a count. load_sessions() pre-sorts by urgency
-        # then recency, so sessions[0] is the one worth surfacing.
-        lead = sessions[0] if sessions else None
-        headline = (lead.get("title") or lead.get("project") or "") if lead else ""
-        self.title = "%s  %s" % (badge, _clip(headline, 40)) if headline else badge
-        self.menu.clear()
-        self.menu.update(self._build_menu(sessions, counts))
+            waiting = counts["waiting"]
+            # Badge counts only sessions blocked on YOU (approval prompts). Rate-
+            # limited ones are stuck on the clock, not on an action, so they stay
+            # out of the badge and just show their own row/dot in the menu.
+            badge = "%s %d" % (ICON, waiting) if waiting else ICON
+            # Menu-bar text is JUST the icon + waiting count (e.g. "◧ 2"), never
+            # the chat title. On a notched Mac the menu bar has little room beside
+            # the notch, and a wide title — especially CJK, which renders ~2× wide
+            # — overflows it, so macOS hides status items (ours AND neighbouring
+            # icons). The per-session chat title still shows in the dropdown rows
+            # (proj · title) and the dashboard, where horizontal space is free.
+            self.title = badge
+            self.menu.clear()
+            self.menu.update(self._build_menu(sessions, counts))
+        except Exception:
+            # Never let a transient failure kill the timer or blank the icon; the
+            # floor set above stands and the next tick retries from scratch.
+            pass
 
     def _maybe_notify(self, sessions):
         """Fire on state changes, and re-ping prompts you haven't dealt with.
@@ -368,7 +422,11 @@ class AdhdMenuApp(rumps.App):
                 self.last_notified.pop(sid, None)
             if prev is None or not self.notify_enabled:
                 continue
-            proj = s.get("project") or "?"
+            # Tag the toast title with the agent (cc/cx) so a banner tells you
+            # whether it's Claude or Codex that needs you / finished, and with
+            # the chat title so the banner says what the session is about, not
+            # just where it lives (matches the "proj · title" menu rows).
+            proj = _session_label(s)
             detail = s.get("detail") or ""
             if st == "waiting" and prev != "waiting":
                 notify("🔴 %s needs you" % proj, detail or "waiting for approval",
@@ -424,7 +482,8 @@ class AdhdMenuApp(rumps.App):
             if send_text_to_session(s, RESUME_TEXT):
                 rec["tries"] += 1
                 if rec["tries"] == 1:
-                    notify("↩️ %s — resuming" % (s.get("project") or "?"),
+                    notify("↩️ %s %s — resuming" % (
+                        tool_tag(s.get("tool")), s.get("project") or "?"),
                            "sent “%s” to clear the limit" % RESUME_TEXT)
         # Drop sessions no longer limited so a fresh limit re-arms from scratch.
         for sid in list(self.limited):
@@ -447,13 +506,11 @@ class AdhdMenuApp(rumps.App):
             for s in sessions:
                 st = s.get("state", "idle")
                 dot = DOT.get(st, "⚪️")
-                proj = s.get("project") or "?"
                 detail = s.get("detail") or LABEL.get(st, st)
                 age = fmt_age(now - s.get("updated", now))
-                # Show the chat title alongside the folder (proj · title) so rows
-                # say what each session is about, not just where it lives.
-                chat = s.get("title")
-                name = "%s · %s" % (proj, _clip(chat, 36)) if chat else proj
+                # Tag the folder with the agent (cc/cx) and, when known, the chat
+                # title (proj · title) so rows say what each session is about.
+                name = _session_label(s)
                 title = "%s  %s — %s (%s)" % (dot, name, detail, age)
                 item = rumps.MenuItem(title, callback=self._make_focus(s))
                 items.append(item)
